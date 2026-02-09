@@ -166,6 +166,7 @@ impl Parser {
             // This is handled by returning count as the new limit
             // and the original limit value as offset
             let offset_expr = limit.clone();
+            let compound = self.parse_compound_tail()?;
             return Ok(SelectStatement {
                 distinct,
                 columns,
@@ -176,12 +177,13 @@ impl Parser {
                 order_by,
                 limit: Some(count),
                 offset: offset_expr,
+                compound,
             });
         } else {
             None
         };
 
-        Ok(SelectStatement {
+        let mut sel = SelectStatement {
             distinct,
             columns,
             from,
@@ -191,7 +193,36 @@ impl Parser {
             order_by,
             limit,
             offset,
-        })
+            compound: None,
+        };
+
+        // Check for compound operators: UNION, EXCEPT, INTERSECT
+        sel.compound = self.parse_compound_tail()?;
+
+        Ok(sel)
+    }
+
+    fn parse_compound_tail(&mut self) -> Result<Option<Box<CompoundSelect>>> {
+        let op = if self.check(&Token::Union) {
+            self.advance();
+            if self.check(&Token::All) {
+                self.advance();
+                CompoundOp::UnionAll
+            } else {
+                CompoundOp::Union
+            }
+        } else if self.check(&Token::Except) {
+            self.advance();
+            CompoundOp::Except
+        } else if self.check(&Token::Intersect) {
+            self.advance();
+            CompoundOp::Intersect
+        } else {
+            return Ok(None);
+        };
+
+        let select = self.parse_select()?;
+        Ok(Some(Box::new(CompoundSelect { op, select })))
     }
 
     fn parse_select_columns(&mut self) -> Result<Vec<SelectColumn>> {
@@ -400,13 +431,49 @@ impl Parser {
         let table_name = self.parse_identifier()?;
 
         let columns = if self.check(&Token::LeftParen) {
+            // Could be column list or could be subquery in INSERT ... SELECT
+            // Peek ahead to check if it's a SELECT
             self.advance();
+            if self.check(&Token::Select) {
+                // It's INSERT INTO table (SELECT ...)
+                let query = self.parse_select()?;
+                self.expect(&Token::RightParen)?;
+                return Ok(Statement::Insert(InsertStatement {
+                    table_name,
+                    columns: None,
+                    source: InsertSource::Select(Box::new(query)),
+                    or_replace,
+                }));
+            }
             let cols = self.parse_identifier_list()?;
             self.expect(&Token::RightParen)?;
             Some(cols)
         } else {
             None
         };
+
+        // DEFAULT VALUES
+        if self.check(&Token::Default) {
+            self.advance();
+            self.expect(&Token::Values)?;
+            return Ok(Statement::Insert(InsertStatement {
+                table_name,
+                columns,
+                source: InsertSource::DefaultValues,
+                or_replace,
+            }));
+        }
+
+        // INSERT ... SELECT
+        if self.check(&Token::Select) {
+            let query = self.parse_select()?;
+            return Ok(Statement::Insert(InsertStatement {
+                table_name,
+                columns,
+                source: InsertSource::Select(Box::new(query)),
+                or_replace,
+            }));
+        }
 
         self.expect(&Token::Values)?;
 
@@ -425,7 +492,7 @@ impl Parser {
         Ok(Statement::Insert(InsertStatement {
             table_name,
             columns,
-            values,
+            source: InsertSource::Values(values),
             or_replace,
         }))
     }
@@ -1688,8 +1755,12 @@ mod tests {
         if let Statement::Insert(ins) = stmt {
             assert_eq!(ins.table_name, "users");
             assert_eq!(ins.columns.as_ref().unwrap().len(), 2);
-            assert_eq!(ins.values.len(), 1);
-            assert_eq!(ins.values[0].len(), 2);
+            if let InsertSource::Values(values) = &ins.source {
+                assert_eq!(values.len(), 1);
+                assert_eq!(values[0].len(), 2);
+            } else {
+                panic!("Expected VALUES source");
+            }
         } else {
             panic!("Expected INSERT");
         }
@@ -1795,5 +1866,157 @@ mod tests {
         } else {
             panic!("Expected CREATE INDEX");
         }
+    }
+
+    // ======== Phase 7 Parser Tests ========
+
+    #[test]
+    fn test_parse_union() {
+        let stmt = parse_sql("SELECT x FROM t1 UNION SELECT x FROM t2").unwrap();
+        if let Statement::Select(sel) = stmt {
+            assert!(sel.compound.is_some());
+            let compound = sel.compound.unwrap();
+            assert_eq!(compound.op, CompoundOp::Union);
+        } else {
+            panic!("Expected SELECT");
+        }
+    }
+
+    #[test]
+    fn test_parse_union_all() {
+        let stmt = parse_sql("SELECT x FROM t1 UNION ALL SELECT x FROM t2").unwrap();
+        if let Statement::Select(sel) = stmt {
+            assert!(sel.compound.is_some());
+            let compound = sel.compound.unwrap();
+            assert_eq!(compound.op, CompoundOp::UnionAll);
+        } else {
+            panic!("Expected SELECT");
+        }
+    }
+
+    #[test]
+    fn test_parse_except() {
+        let stmt = parse_sql("SELECT x FROM t1 EXCEPT SELECT x FROM t2").unwrap();
+        if let Statement::Select(sel) = stmt {
+            assert!(sel.compound.is_some());
+            let compound = sel.compound.unwrap();
+            assert_eq!(compound.op, CompoundOp::Except);
+        } else {
+            panic!("Expected SELECT");
+        }
+    }
+
+    #[test]
+    fn test_parse_intersect() {
+        let stmt = parse_sql("SELECT x FROM t1 INTERSECT SELECT x FROM t2").unwrap();
+        if let Statement::Select(sel) = stmt {
+            assert!(sel.compound.is_some());
+            let compound = sel.compound.unwrap();
+            assert_eq!(compound.op, CompoundOp::Intersect);
+        } else {
+            panic!("Expected SELECT");
+        }
+    }
+
+    #[test]
+    fn test_parse_insert_select() {
+        let stmt = parse_sql("INSERT INTO t2 SELECT * FROM t1").unwrap();
+        if let Statement::Insert(ins) = stmt {
+            assert_eq!(ins.table_name, "t2");
+            assert!(matches!(ins.source, InsertSource::Select(_)));
+        } else {
+            panic!("Expected INSERT");
+        }
+    }
+
+    #[test]
+    fn test_parse_insert_default_values() {
+        let stmt = parse_sql("INSERT INTO t DEFAULT VALUES").unwrap();
+        if let Statement::Insert(ins) = stmt {
+            assert_eq!(ins.table_name, "t");
+            assert!(matches!(ins.source, InsertSource::DefaultValues));
+        } else {
+            panic!("Expected INSERT");
+        }
+    }
+
+    #[test]
+    fn test_parse_drop_table() {
+        let stmt = parse_sql("DROP TABLE IF EXISTS users").unwrap();
+        if let Statement::DropTable(dt) = stmt {
+            assert_eq!(dt.table_name, "users");
+            assert!(dt.if_exists);
+        } else {
+            panic!("Expected DROP TABLE");
+        }
+    }
+
+    #[test]
+    fn test_parse_drop_index() {
+        let stmt = parse_sql("DROP INDEX IF EXISTS idx_name").unwrap();
+        if let Statement::DropIndex(di) = stmt {
+            assert_eq!(di.index_name, "idx_name");
+            assert!(di.if_exists);
+        } else {
+            panic!("Expected DROP INDEX");
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_table_rename() {
+        let stmt = parse_sql("ALTER TABLE users RENAME TO people").unwrap();
+        if let Statement::AlterTable(AlterTableStatement::RenameTable {
+            table_name,
+            new_name,
+        }) = stmt
+        {
+            assert_eq!(table_name, "users");
+            assert_eq!(new_name, "people");
+        } else {
+            panic!("Expected ALTER TABLE RENAME");
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_table_add_column() {
+        let stmt = parse_sql("ALTER TABLE users ADD COLUMN email TEXT").unwrap();
+        if let Statement::AlterTable(AlterTableStatement::AddColumn { table_name, column }) = stmt {
+            assert_eq!(table_name, "users");
+            assert_eq!(column.name, "email");
+            assert_eq!(column.type_name.as_deref(), Some("TEXT"));
+        } else {
+            panic!("Expected ALTER TABLE ADD COLUMN");
+        }
+    }
+
+    #[test]
+    fn test_parse_pragma() {
+        let stmt = parse_sql("PRAGMA table_info(users)").unwrap();
+        if let Statement::Pragma(p) = stmt {
+            assert_eq!(p.name, "table_info");
+            assert!(p.value.is_some());
+        } else {
+            panic!("Expected PRAGMA");
+        }
+    }
+
+    #[test]
+    fn test_parse_multi_row_insert() {
+        let stmt = parse_sql("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
+        if let Statement::Insert(ins) = stmt {
+            if let InsertSource::Values(values) = &ins.source {
+                assert_eq!(values.len(), 3);
+            } else {
+                panic!("Expected VALUES source");
+            }
+        } else {
+            panic!("Expected INSERT");
+        }
+    }
+
+    #[test]
+    fn test_parse_explain() {
+        let stmt = parse_sql("EXPLAIN SELECT * FROM t").unwrap();
+        assert!(matches!(stmt, Statement::Explain(_)));
     }
 }

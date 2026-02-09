@@ -44,6 +44,10 @@ pub fn eval_function(name: &str, args: &[Value]) -> Option<Value> {
         "LAST_INSERT_ROWID" => Some(Value::Integer(0)),
         "SQLITE_VERSION" => Some(Value::Text("3.39.0".into())),
         "PRINTF" | "FORMAT" => Some(fn_printf(args)),
+        "ROUND" => Some(fn_round(args)),
+        "SIGN" => Some(fn_sign(args)),
+        "IIF" => Some(fn_iif(args)),
+        "TOTAL" => Some(fn_total(args)),
         "LIKE" => {
             if args.len() >= 2 {
                 let pattern = args[0].to_text();
@@ -438,6 +442,76 @@ fn fn_printf(args: &[Value]) -> Value {
         }
     }
     Value::Text(result)
+}
+
+fn fn_round(args: &[Value]) -> Value {
+    if args.is_empty() || args[0].is_null() {
+        return Value::Null;
+    }
+    let val = args[0].to_real().unwrap_or(0.0);
+    let decimals = if args.len() > 1 {
+        args[1].to_integer().unwrap_or(0)
+    } else {
+        0
+    };
+    let factor = 10f64.powi(decimals as i32);
+    Value::Real((val * factor).round() / factor)
+}
+
+fn fn_sign(args: &[Value]) -> Value {
+    if args.is_empty() || args[0].is_null() {
+        return Value::Null;
+    }
+    match &args[0] {
+        Value::Integer(i) => Value::Integer(i.signum()),
+        Value::Real(f) => {
+            if *f > 0.0 {
+                Value::Integer(1)
+            } else if *f < 0.0 {
+                Value::Integer(-1)
+            } else {
+                Value::Integer(0)
+            }
+        }
+        Value::Text(s) => {
+            if let Ok(i) = s.parse::<i64>() {
+                Value::Integer(i.signum())
+            } else if let Ok(f) = s.parse::<f64>() {
+                if f > 0.0 {
+                    Value::Integer(1)
+                } else if f < 0.0 {
+                    Value::Integer(-1)
+                } else {
+                    Value::Integer(0)
+                }
+            } else {
+                Value::Integer(0)
+            }
+        }
+        _ => Value::Integer(0),
+    }
+}
+
+fn fn_iif(args: &[Value]) -> Value {
+    if args.len() < 3 {
+        return Value::Null;
+    }
+    if args[0].is_truthy() {
+        args[1].clone()
+    } else {
+        args[2].clone()
+    }
+}
+
+fn fn_total(args: &[Value]) -> Value {
+    // TOTAL is like SUM but returns 0.0 instead of NULL for empty sets
+    let mut sum = 0.0;
+    for arg in args {
+        if let Some(f) = arg.to_real() {
+            sum += f;
+        }
+    }
+    Value::Real(sum)
 }
 
 /// LIKE pattern matching (case-insensitive by default).

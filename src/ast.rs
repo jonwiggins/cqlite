@@ -32,6 +32,23 @@ pub struct SelectStatement {
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<Expr>,
     pub offset: Option<Expr>,
+    /// Compound operator (UNION, UNION ALL, EXCEPT, INTERSECT) with another SELECT
+    pub compound: Option<Box<CompoundSelect>>,
+}
+
+/// Compound SELECT (UNION, UNION ALL, EXCEPT, INTERSECT)
+#[derive(Debug, Clone)]
+pub struct CompoundSelect {
+    pub op: CompoundOp,
+    pub select: SelectStatement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompoundOp {
+    Union,
+    UnionAll,
+    Except,
+    Intersect,
 }
 
 #[derive(Debug, Clone)]
@@ -205,8 +222,16 @@ pub enum BinaryOperator {
 pub struct InsertStatement {
     pub table_name: String,
     pub columns: Option<Vec<String>>,
-    pub values: Vec<Vec<Expr>>,
+    pub source: InsertSource,
     pub or_replace: bool,
+}
+
+/// Source of data for INSERT.
+#[derive(Debug, Clone)]
+pub enum InsertSource {
+    Values(Vec<Vec<Expr>>),
+    Select(Box<SelectStatement>),
+    DefaultValues,
 }
 
 /// UPDATE statement.

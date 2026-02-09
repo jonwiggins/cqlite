@@ -1,0 +1,18 @@
+[package]
+name = "rsqlite"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rsqlite"
+path = "src/main.rs"
+
+[lib]
+name = "rsqlite"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "1"
+
+[dev-dependencies]
+tempfile = "3"

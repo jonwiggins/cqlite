@@ -217,13 +217,23 @@ pub enum BinaryOperator {
     ShiftRight,
 }
 
+/// Conflict resolution for INSERT OR ... statements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictClause {
+    Abort, // default
+    Rollback,
+    Fail,
+    Ignore,
+    Replace,
+}
+
 /// INSERT statement.
 #[derive(Debug, Clone)]
 pub struct InsertStatement {
     pub table_name: String,
     pub columns: Option<Vec<String>>,
     pub source: InsertSource,
-    pub or_replace: bool,
+    pub on_conflict: ConflictClause,
 }
 
 /// Source of data for INSERT.

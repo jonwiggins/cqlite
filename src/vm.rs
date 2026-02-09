@@ -1,7 +1,7 @@
 /// Virtual machine / query executor.
 /// Uses a Volcano-style tree-of-iterators model for query execution.
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
 use crate::btree;
@@ -20,6 +20,7 @@ pub struct TableSchema {
     pub sql: String,
     pub is_autoincrement: bool,
     pub primary_key_column: Option<usize>,
+    pub check_constraints: Vec<Expr>,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +124,7 @@ impl Database {
                 sql: String::new(),
                 is_autoincrement: false,
                 primary_key_column: None,
+                check_constraints: Vec::new(),
             });
         }
 
@@ -161,15 +163,31 @@ impl Database {
                 });
             }
 
-            // Check table constraints for PRIMARY KEY
+            // Check table constraints for PRIMARY KEY and CHECK
+            let mut check_constraints = Vec::new();
             for constraint in &ct.constraints {
-                if let TableConstraint::PrimaryKey(cols) = constraint {
-                    if cols.len() == 1 {
-                        for (i, c) in columns.iter().enumerate() {
-                            if c.name.eq_ignore_ascii_case(&cols[0]) {
-                                pk_col = Some(i);
+                match constraint {
+                    TableConstraint::PrimaryKey(cols) => {
+                        if cols.len() == 1 {
+                            for (i, c) in columns.iter().enumerate() {
+                                if c.name.eq_ignore_ascii_case(&cols[0]) {
+                                    pk_col = Some(i);
+                                }
                             }
                         }
+                    }
+                    TableConstraint::Check(expr) => {
+                        check_constraints.push(expr.clone());
+                    }
+                    _ => {}
+                }
+            }
+
+            // Also collect column-level CHECK constraints
+            for col in &ct.columns {
+                for constraint in &col.constraints {
+                    if let ColumnConstraint::Check(expr) = constraint {
+                        check_constraints.push(expr.clone());
                     }
                 }
             }
@@ -181,6 +199,7 @@ impl Database {
                 sql: sql.to_string(),
                 is_autoincrement,
                 primary_key_column: pk_col,
+                check_constraints,
             })
         } else {
             Err(RsqliteError::Internal("Expected CREATE TABLE".into()))
@@ -276,15 +295,22 @@ impl Database {
 
         // DISTINCT
         if sel.distinct {
-            let mut seen = Vec::new();
+            let mut seen = HashSet::new();
             rows.retain(|row| {
-                let key: Vec<Value> = row.values.clone();
-                if seen.contains(&key) {
-                    false
-                } else {
-                    seen.push(key);
-                    true
-                }
+                // Build a canonical string key for hashing
+                let key: String = row
+                    .values
+                    .iter()
+                    .map(|v| match v {
+                        Value::Null => "N".to_string(),
+                        Value::Integer(i) => format!("I:{}", i),
+                        Value::Real(f) => format!("R:{:?}", f),
+                        Value::Text(s) => format!("T:{}", s),
+                        Value::Blob(b) => format!("B:{:?}", b),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|");
+                seen.insert(key)
             });
         }
 
@@ -1444,6 +1470,29 @@ impl Database {
                 }
             }
 
+            // Enforce CHECK constraints
+            if !schema.check_constraints.is_empty() {
+                let check_row = Row {
+                    values: record_values.clone(),
+                    columns: schema
+                        .columns
+                        .iter()
+                        .map(|c| (ins.table_name.clone(), c.name.clone()))
+                        .collect(),
+                    table_alias: Some(ins.table_name.clone()),
+                    rowid: 0,
+                };
+                for check_expr in &schema.check_constraints {
+                    let result = self.eval_expr_in_row(check_expr, &check_row, &[])?;
+                    if !result.is_null() && !result.is_truthy() {
+                        return Err(RsqliteError::Constraint(format!(
+                            "CHECK constraint failed: {}",
+                            ins.table_name
+                        )));
+                    }
+                }
+            }
+
             // Determine rowid
             let rowid = if let Some(pk_idx) = schema.primary_key_column {
                 if let Value::Integer(id) = &record_values[pk_idx] {
@@ -1472,36 +1521,97 @@ impl Database {
                 .cloned()
                 .collect();
 
-            if !ins.or_replace {
-                for idx in &indexes {
-                    if idx.unique {
-                        let key_values: Vec<Value> = idx
-                            .columns
-                            .iter()
-                            .map(|col_name| {
-                                schema
-                                    .columns
-                                    .iter()
-                                    .position(|c| c.name.eq_ignore_ascii_case(col_name))
-                                    .map(|i| record_values[i].clone())
-                                    .unwrap_or(Value::Null)
-                            })
-                            .collect();
-                        // Check if any existing row has the same key values
-                        if key_values.iter().all(|v| !v.is_null()) {
-                            let existing = btree::scan_index(&mut self.pager, idx.root_page)?;
-                            for entry in &existing {
-                                let entry_keys = &entry[..entry.len().saturating_sub(1)];
-                                if entry_keys == key_values.as_slice() {
-                                    return Err(RsqliteError::Constraint(format!(
-                                        "UNIQUE constraint failed: {}",
-                                        idx.name
-                                    )));
+            // Enforce UNIQUE constraints via indexes
+            let mut skip_row = false;
+            for idx in &indexes {
+                if idx.unique {
+                    let key_values: Vec<Value> = idx
+                        .columns
+                        .iter()
+                        .map(|col_name| {
+                            schema
+                                .columns
+                                .iter()
+                                .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                                .map(|i| record_values[i].clone())
+                                .unwrap_or(Value::Null)
+                        })
+                        .collect();
+                    // Check if any existing row has the same key values
+                    if key_values.iter().all(|v| !v.is_null()) {
+                        let existing = btree::scan_index(&mut self.pager, idx.root_page)?;
+                        for entry in &existing {
+                            let entry_keys = &entry[..entry.len().saturating_sub(1)];
+                            if entry_keys == key_values.as_slice() {
+                                match ins.on_conflict {
+                                    ConflictClause::Replace => {
+                                        // Delete the conflicting row
+                                        if let Some(Value::Integer(conflict_rowid)) = entry.last() {
+                                            btree::delete_from_table(
+                                                &mut self.pager,
+                                                current_root,
+                                                *conflict_rowid,
+                                            )?;
+                                            // Delete from all indexes
+                                            for idx2 in &indexes {
+                                                btree::delete_from_index(
+                                                    &mut self.pager,
+                                                    idx2.root_page,
+                                                    *conflict_rowid,
+                                                )?;
+                                            }
+                                        }
+                                    }
+                                    ConflictClause::Ignore => {
+                                        skip_row = true;
+                                    }
+                                    _ => {
+                                        // Abort (default), Rollback, Fail
+                                        return Err(RsqliteError::Constraint(format!(
+                                            "UNIQUE constraint failed: {}",
+                                            idx.name
+                                        )));
+                                    }
                                 }
+                                break;
                             }
                         }
                     }
                 }
+                if skip_row {
+                    break;
+                }
+            }
+
+            // Also check for PRIMARY KEY (rowid) conflicts for OR REPLACE
+            if !skip_row && ins.on_conflict == ConflictClause::Replace {
+                if let Some(pk_idx) = schema.primary_key_column {
+                    if let Value::Integer(_) = &record_values[pk_idx] {
+                        // Check if a row with this rowid already exists
+                        let existing_rows = btree::scan_table(&mut self.pager, current_root)?;
+                        for (existing_rowid, _) in &existing_rows {
+                            if *existing_rowid == rowid {
+                                btree::delete_from_table(
+                                    &mut self.pager,
+                                    current_root,
+                                    *existing_rowid,
+                                )?;
+                                for idx in &indexes {
+                                    btree::delete_from_index(
+                                        &mut self.pager,
+                                        idx.root_page,
+                                        *existing_rowid,
+                                    )?;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if skip_row {
+                continue;
             }
 
             // If the primary key column is an integer PK alias (rowid alias),
@@ -1616,6 +1726,29 @@ impl Database {
                     }
                     new_values[col_idx] = new_val;
                 }
+
+                // Enforce CHECK constraints
+                if !schema.check_constraints.is_empty() {
+                    let check_row = Row {
+                        values: new_values.clone(),
+                        columns: column_names
+                            .iter()
+                            .map(|n| (upd.table_name.clone(), n.clone()))
+                            .collect(),
+                        table_alias: Some(upd.table_name.clone()),
+                        rowid: *rowid,
+                    };
+                    for check_expr in &schema.check_constraints {
+                        let result = self.eval_expr_in_row(check_expr, &check_row, &[])?;
+                        if !result.is_null() && !result.is_truthy() {
+                            return Err(RsqliteError::Constraint(format!(
+                                "CHECK constraint failed: {}",
+                                upd.table_name
+                            )));
+                        }
+                    }
+                }
+
                 updates.push((*rowid, new_values));
             }
         }
@@ -2021,15 +2154,122 @@ impl Database {
     }
 
     fn execute_explain(&mut self, stmt: &Statement) -> Result<ExecuteResult> {
-        let plan = format!("{:#?}", stmt);
+        let mut details = Vec::new();
+        self.explain_stmt(stmt, &mut details, 0);
         Ok(ExecuteResult {
-            columns: vec!["detail".into()],
-            rows: plan
-                .lines()
-                .map(|l| vec![Value::Text(l.to_string())])
+            columns: vec!["addr".into(), "opcode".into(), "detail".into()],
+            rows: details
+                .into_iter()
+                .enumerate()
+                .map(|(i, (opcode, detail))| {
+                    vec![
+                        Value::Integer(i as i64),
+                        Value::Text(opcode),
+                        Value::Text(detail),
+                    ]
+                })
                 .collect(),
             rows_affected: 0,
         })
+    }
+
+    fn explain_stmt(&self, stmt: &Statement, out: &mut Vec<(String, String)>, _depth: usize) {
+        match stmt {
+            Statement::Select(sel) => self.explain_select(sel, out),
+            Statement::Insert(ins) => {
+                out.push(("OpenWrite".into(), format!("table={}", ins.table_name)));
+                match &ins.source {
+                    InsertSource::Values(rows) => {
+                        for (i, _) in rows.iter().enumerate() {
+                            out.push(("MakeRecord".into(), format!("row {}", i + 1)));
+                            out.push(("Insert".into(), ins.table_name.clone()));
+                        }
+                    }
+                    InsertSource::Select(query) => {
+                        self.explain_select(query, out);
+                        out.push(("Insert".into(), ins.table_name.clone()));
+                    }
+                    InsertSource::DefaultValues => {
+                        out.push(("MakeRecord".into(), "default values".into()));
+                        out.push(("Insert".into(), ins.table_name.clone()));
+                    }
+                }
+            }
+            Statement::Update(upd) => {
+                out.push(("OpenWrite".into(), format!("table={}", upd.table_name)));
+                out.push(("Scan".into(), upd.table_name.clone()));
+                if upd.where_clause.is_some() {
+                    out.push(("Filter".into(), "WHERE clause".into()));
+                }
+                for (col, _) in &upd.assignments {
+                    out.push(("SetColumn".into(), col.clone()));
+                }
+            }
+            Statement::Delete(del) => {
+                out.push(("OpenWrite".into(), format!("table={}", del.table_name)));
+                out.push(("Scan".into(), del.table_name.clone()));
+                if del.where_clause.is_some() {
+                    out.push(("Filter".into(), "WHERE clause".into()));
+                }
+                out.push(("Delete".into(), del.table_name.clone()));
+            }
+            Statement::CreateTable(ct) => {
+                out.push(("CreateTable".into(), ct.table_name.clone()));
+            }
+            Statement::CreateIndex(ci) => {
+                out.push((
+                    "CreateIndex".into(),
+                    format!("{} ON {}", ci.index_name, ci.table_name),
+                ));
+            }
+            _ => {
+                out.push(("Execute".into(), format!("{:?}", stmt)));
+            }
+        }
+        out.push(("Halt".into(), String::new()));
+    }
+
+    fn explain_select(&self, sel: &SelectStatement, out: &mut Vec<(String, String)>) {
+        if let Some(ref from) = sel.from {
+            match from {
+                FromClause::Table { name, alias, .. } => {
+                    let detail = if let Some(a) = alias {
+                        format!("table={} AS {}", name, a)
+                    } else {
+                        format!("table={}", name)
+                    };
+                    out.push(("Scan".into(), detail));
+                }
+                FromClause::Join(join) => {
+                    out.push(("NestedLoop".into(), format!("{:?} JOIN", join.join_type)));
+                }
+                FromClause::Subquery { alias, .. } => {
+                    out.push(("Subquery".into(), format!("AS {}", alias)));
+                }
+            }
+        }
+        if sel.where_clause.is_some() {
+            out.push(("Filter".into(), "WHERE clause".into()));
+        }
+        if !sel.group_by.is_empty() {
+            out.push(("GroupBy".into(), format!("{} key(s)", sel.group_by.len())));
+        }
+        if sel.having.is_some() {
+            out.push(("Filter".into(), "HAVING clause".into()));
+        }
+        if !sel.order_by.is_empty() {
+            out.push(("SortBy".into(), format!("{} key(s)", sel.order_by.len())));
+        }
+        if sel.limit.is_some() {
+            out.push(("Limit".into(), String::new()));
+        }
+        if sel.distinct {
+            out.push(("Distinct".into(), String::new()));
+        }
+        out.push((
+            "ResultRow".into(),
+            format!("{} column(s)", sel.columns.len()),
+        ));
     }
 
     fn execute_pragma(&mut self, pragma: &PragmaStatement) -> Result<ExecuteResult> {
@@ -2308,6 +2548,7 @@ impl Database {
                     sql: sql.into(),
                     is_autoincrement: false,
                     primary_key_column: None,
+                    check_constraints: Vec::new(),
                 },
             );
         }
@@ -2419,10 +2660,42 @@ fn format_create_table_sql(ct: &CreateTableStatement) -> String {
                     sql.push_str(" DEFAULT ");
                     sql.push_str(&format_expr(expr));
                 }
-                ColumnConstraint::Check(_) => sql.push_str(" CHECK(...)"),
+                ColumnConstraint::Check(expr) => {
+                    sql.push_str(" CHECK(");
+                    sql.push_str(&format_expr(expr));
+                    sql.push(')');
+                }
                 ColumnConstraint::References { table, columns } => {
                     sql.push_str(&format!(" REFERENCES {}({})", table, columns.join(", ")));
                 }
+            }
+        }
+    }
+    // Table-level constraints
+    for constraint in &ct.constraints {
+        match constraint {
+            TableConstraint::PrimaryKey(cols) => {
+                sql.push_str(&format!(", PRIMARY KEY({})", cols.join(", ")));
+            }
+            TableConstraint::Unique(cols) => {
+                sql.push_str(&format!(", UNIQUE({})", cols.join(", ")));
+            }
+            TableConstraint::Check(expr) => {
+                sql.push_str(", CHECK(");
+                sql.push_str(&format_expr(expr));
+                sql.push(')');
+            }
+            TableConstraint::ForeignKey {
+                columns,
+                ref_table,
+                ref_columns,
+            } => {
+                sql.push_str(&format!(
+                    ", FOREIGN KEY({}) REFERENCES {}({})",
+                    columns.join(", "),
+                    ref_table,
+                    ref_columns.join(", ")
+                ));
             }
         }
     }
@@ -2436,7 +2709,45 @@ fn format_expr(expr: &Expr) -> String {
         Expr::Integer(i) => i.to_string(),
         Expr::Float(f) => f.to_string(),
         Expr::String(s) => format!("'{}'", s.replace('\'', "''")),
-        _ => "?".into(),
+        Expr::Column { table: None, name } => name.clone(),
+        Expr::Column {
+            table: Some(t),
+            name,
+        } => format!("{}.{}", t, name),
+        Expr::BinaryOp { left, op, right } => {
+            let op_str = match op {
+                BinaryOperator::Add => "+",
+                BinaryOperator::Subtract => "-",
+                BinaryOperator::Multiply => "*",
+                BinaryOperator::Divide => "/",
+                BinaryOperator::Modulo => "%",
+                BinaryOperator::Eq => "=",
+                BinaryOperator::NotEq => "!=",
+                BinaryOperator::Lt => "<",
+                BinaryOperator::LtEq => "<=",
+                BinaryOperator::Gt => ">",
+                BinaryOperator::GtEq => ">=",
+                BinaryOperator::And => "AND",
+                BinaryOperator::Or => "OR",
+                BinaryOperator::Concat => "||",
+                BinaryOperator::BitAnd => "&",
+                BinaryOperator::BitOr => "|",
+                BinaryOperator::ShiftLeft => "<<",
+                BinaryOperator::ShiftRight => ">>",
+            };
+            format!("{} {} {}", format_expr(left), op_str, format_expr(right))
+        }
+        Expr::UnaryMinus(e) => format!("-{}", format_expr(e)),
+        Expr::UnaryPlus(e) => format!("+{}", format_expr(e)),
+        Expr::Not(e) => format!("NOT {}", format_expr(e)),
+        Expr::IsNull(e) => format!("{} IS NULL", format_expr(e)),
+        Expr::IsNotNull(e) => format!("{} IS NOT NULL", format_expr(e)),
+        Expr::Function { name, args, .. } => {
+            let arg_strs: Vec<String> = args.iter().map(format_expr).collect();
+            format!("{}({})", name, arg_strs.join(", "))
+        }
+        Expr::Star => "*".into(),
+        _ => "NULL".into(),
     }
 }
 
@@ -3307,5 +3618,152 @@ mod tests {
         let result = db.execute("PRAGMA database_list").unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0][1], Value::Text("main".into()));
+    }
+
+    #[test]
+    fn test_insert_or_replace() {
+        let mut db = Database::new_memory();
+        db.execute("CREATE TABLE t (x INTEGER, name TEXT)").unwrap();
+        db.execute("CREATE UNIQUE INDEX idx_x ON t(x)").unwrap();
+
+        db.execute("INSERT INTO t VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'Bob')").unwrap();
+
+        // INSERT OR REPLACE should replace the conflicting row
+        db.execute("INSERT OR REPLACE INTO t VALUES (1, 'Carol')")
+            .unwrap();
+
+        let result = db.execute("SELECT name FROM t WHERE x = 1").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Value::Text("Carol".into()));
+
+        // Total should still be 2 rows
+        let result = db.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(result.rows[0][0], Value::Integer(2));
+    }
+
+    #[test]
+    fn test_insert_or_ignore() {
+        let mut db = Database::new_memory();
+        db.execute("CREATE TABLE t (x INTEGER, y TEXT)").unwrap();
+        db.execute("CREATE UNIQUE INDEX idx_x ON t(x)").unwrap();
+
+        db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+        // INSERT OR IGNORE should silently skip the duplicate
+        db.execute("INSERT OR IGNORE INTO t VALUES (1, 'b')")
+            .unwrap();
+
+        let result = db.execute("SELECT y FROM t WHERE x = 1").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Value::Text("a".into()));
+    }
+
+    #[test]
+    fn test_replace_shorthand() {
+        let mut db = Database::new_memory();
+        db.execute("CREATE TABLE t (x INTEGER, y TEXT)").unwrap();
+        db.execute("CREATE UNIQUE INDEX idx_x ON t(x)").unwrap();
+
+        db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+        // REPLACE INTO is shorthand for INSERT OR REPLACE
+        db.execute("REPLACE INTO t VALUES (1, 'b')").unwrap();
+
+        let result = db.execute("SELECT y FROM t WHERE x = 1").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Value::Text("b".into()));
+    }
+
+    #[test]
+    fn test_check_constraint_insert() {
+        let mut db = Database::new_memory();
+        db.execute("CREATE TABLE t (x INTEGER CHECK(x > 0))")
+            .unwrap();
+
+        db.execute("INSERT INTO t VALUES (5)").unwrap();
+
+        // Should fail - violates CHECK constraint
+        let result = db.execute("INSERT INTO t VALUES (-1)");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("CHECK"));
+    }
+
+    #[test]
+    fn test_check_constraint_update() {
+        let mut db = Database::new_memory();
+        db.execute("CREATE TABLE t (x INTEGER CHECK(x > 0))")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (5)").unwrap();
+
+        // Should fail - violates CHECK constraint
+        let result = db.execute("UPDATE t SET x = -1 WHERE x = 5");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("CHECK"));
+    }
+
+    #[test]
+    fn test_table_level_check_constraint() {
+        let mut db = Database::new_memory();
+        db.execute("CREATE TABLE t (x INTEGER, y INTEGER, CHECK(x < y))")
+            .unwrap();
+
+        db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+
+        // Should fail - x > y
+        let result = db.execute("INSERT INTO t VALUES (10, 1)");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_explain_select() {
+        let mut db = Database::new_memory();
+        db.execute("CREATE TABLE t (x INTEGER)").unwrap();
+
+        let result = db.execute("EXPLAIN SELECT * FROM t WHERE x > 0").unwrap();
+        assert!(!result.rows.is_empty());
+        assert_eq!(result.columns.len(), 3);
+        assert_eq!(result.columns[0], "addr");
+        assert_eq!(result.columns[1], "opcode");
+        assert_eq!(result.columns[2], "detail");
+
+        // Should have Scan and Filter operations
+        let opcodes: Vec<String> = result.rows.iter().map(|r| r[1].to_text()).collect();
+        assert!(opcodes.contains(&"Scan".to_string()));
+        assert!(opcodes.contains(&"Filter".to_string()));
+        assert!(opcodes.contains(&"Halt".to_string()));
+    }
+
+    #[test]
+    fn test_explain_insert() {
+        let mut db = Database::new_memory();
+        db.execute("CREATE TABLE t (x INTEGER)").unwrap();
+
+        let result = db.execute("EXPLAIN INSERT INTO t VALUES (1)").unwrap();
+        let opcodes: Vec<String> = result.rows.iter().map(|r| r[1].to_text()).collect();
+        assert!(opcodes.contains(&"OpenWrite".to_string()));
+        assert!(opcodes.contains(&"Insert".to_string()));
+    }
+
+    #[test]
+    fn test_insert_or_ignore_multi_row() {
+        let mut db = Database::new_memory();
+        db.execute("CREATE TABLE t (x INTEGER UNIQUE)").unwrap();
+        // The UNIQUE in column constraint doesn't automatically create an index
+        // in our implementation, so create one explicitly
+        db.execute("CREATE UNIQUE INDEX idx_x ON t(x)").unwrap();
+
+        db.execute("INSERT INTO t VALUES (1)").unwrap();
+        db.execute("INSERT INTO t VALUES (2)").unwrap();
+
+        // Should ignore the duplicate 1 but insert 3
+        db.execute("INSERT OR IGNORE INTO t VALUES (1)").unwrap();
+        db.execute("INSERT OR IGNORE INTO t VALUES (3)").unwrap();
+
+        let result = db.execute("SELECT x FROM t ORDER BY x").unwrap();
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(result.rows[0][0], Value::Integer(1));
+        assert_eq!(result.rows[1][0], Value::Integer(2));
+        assert_eq!(result.rows[2][0], Value::Integer(3));
     }
 }

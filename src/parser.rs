@@ -405,25 +405,34 @@ impl Parser {
     }
 
     fn parse_insert_stmt(&mut self) -> Result<Statement> {
-        let or_replace = if self.check(&Token::Replace) {
+        let on_conflict = if self.check(&Token::Replace) {
             self.advance();
-            true
+            ConflictClause::Replace
         } else {
             self.expect(&Token::Insert)?;
             if self.check(&Token::Or) {
                 self.advance();
                 if self.check(&Token::Replace) {
                     self.advance();
-                    true
+                    ConflictClause::Replace
                 } else if self.check(&Token::Ignore) {
                     self.advance();
-                    false // simplified
+                    ConflictClause::Ignore
+                } else if self.check(&Token::Rollback) {
+                    self.advance();
+                    ConflictClause::Rollback
+                } else if self.check(&Token::Abort) {
+                    self.advance();
+                    ConflictClause::Abort
+                } else if self.check(&Token::Fail) {
+                    self.advance();
+                    ConflictClause::Fail
                 } else {
-                    self.advance(); // skip conflict resolution
-                    false
+                    self.advance(); // skip unknown conflict resolution
+                    ConflictClause::Abort
                 }
             } else {
-                false
+                ConflictClause::Abort
             }
         };
 
@@ -442,7 +451,7 @@ impl Parser {
                     table_name,
                     columns: None,
                     source: InsertSource::Select(Box::new(query)),
-                    or_replace,
+                    on_conflict,
                 }));
             }
             let cols = self.parse_identifier_list()?;
@@ -460,7 +469,7 @@ impl Parser {
                 table_name,
                 columns,
                 source: InsertSource::DefaultValues,
-                or_replace,
+                on_conflict,
             }));
         }
 
@@ -471,7 +480,7 @@ impl Parser {
                 table_name,
                 columns,
                 source: InsertSource::Select(Box::new(query)),
-                or_replace,
+                on_conflict,
             }));
         }
 
@@ -493,7 +502,7 @@ impl Parser {
             table_name,
             columns,
             source: InsertSource::Values(values),
-            or_replace,
+            on_conflict,
         }))
     }
 

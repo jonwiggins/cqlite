@@ -1020,6 +1020,506 @@ impl BTreeCursor {
 }
 
 // ---------------------------------------------------------------------------
+// B-tree write operations
+// ---------------------------------------------------------------------------
+
+/// Initialize a page as an empty table leaf page.
+pub fn init_table_leaf_page(pager: &mut Pager, page_num: PageNumber) -> Result<()> {
+    let header_offset = pager::btree_header_offset(page_num);
+    let page = pager.get_page_mut(page_num)?;
+    let page_size = page.data.len();
+
+    page.data[header_offset] = BTreePageType::TableLeaf.to_flag();
+    format::write_be_u16(&mut page.data, header_offset + 1, 0); // first freeblock
+    format::write_be_u16(&mut page.data, header_offset + 3, 0); // cell count
+    // Cell content offset: start at end of page (no cells yet).
+    format::write_be_u16(&mut page.data, header_offset + 5, page_size as u16);
+    page.data[header_offset + 7] = 0; // fragmented free bytes
+
+    Ok(())
+}
+
+/// Build the on-page representation of a table leaf cell.
+/// Format: payload_length (varint), rowid (varint), payload.
+pub fn build_table_leaf_cell(rowid: i64, payload: &[u8]) -> Vec<u8> {
+    let mut cell = Vec::new();
+    let mut tmp = [0u8; 9];
+
+    let n = varint::write_varint(&mut tmp, payload.len() as u64);
+    cell.extend_from_slice(&tmp[..n]);
+
+    let n = varint::write_varint(&mut tmp, rowid as u64);
+    cell.extend_from_slice(&tmp[..n]);
+
+    cell.extend_from_slice(payload);
+    cell
+}
+
+/// Insert a row into a table B-tree. The payload should be an encoded record.
+///
+/// Returns the (possibly new) root page number. The root changes if the
+/// original root had to be split.
+pub fn btree_insert(
+    pager: &mut Pager,
+    root_page: PageNumber,
+    rowid: i64,
+    payload: &[u8],
+) -> Result<PageNumber> {
+    let cell_data = build_table_leaf_cell(rowid, payload);
+
+    // Try to insert into the tree, possibly splitting.
+    let split = insert_into_subtree(pager, root_page, rowid, &cell_data)?;
+
+    match split {
+        InsertResult::Ok => Ok(root_page),
+        InsertResult::Split {
+            new_page,
+            divider_rowid,
+        } => {
+            // The root was split. Create a new root.
+            let new_root = pager.allocate_page()?;
+            let header_offset = pager::btree_header_offset(new_root);
+            {
+                let page = pager.get_page_mut(new_root)?;
+                let page_size = page.data.len();
+
+                // Interior page header.
+                page.data[header_offset] = BTreePageType::TableInterior.to_flag();
+                format::write_be_u16(&mut page.data, header_offset + 1, 0);
+                format::write_be_u16(&mut page.data, header_offset + 3, 1); // 1 cell
+                page.data[header_offset + 7] = 0;
+                // right_child = new_page
+                format::write_be_u32(&mut page.data, header_offset + 8, new_page);
+
+                // Build interior cell: left_child (4 bytes) + rowid (varint)
+                let mut cell = Vec::new();
+                cell.extend_from_slice(&root_page.to_be_bytes());
+                let mut tmp = [0u8; 9];
+                let n = varint::write_varint(&mut tmp, divider_rowid as u64);
+                cell.extend_from_slice(&tmp[..n]);
+
+                // Place cell at end of page.
+                let cell_start = page_size - cell.len();
+                page.data[cell_start..page_size].copy_from_slice(&cell);
+
+                // Cell content offset.
+                format::write_be_u16(&mut page.data, header_offset + 5, cell_start as u16);
+
+                // Cell pointer.
+                let ptr_offset = header_offset + 12; // after 12-byte interior header
+                format::write_be_u16(&mut page.data, ptr_offset, cell_start as u16);
+            }
+
+            Ok(new_root)
+        }
+    }
+}
+
+/// Find the maximum rowid in a table B-tree. Returns 0 if the tree is empty.
+pub fn find_max_rowid(pager: &mut Pager, root_page: PageNumber) -> Result<i64> {
+    let mut page_num = root_page;
+
+    loop {
+        let header_offset = pager::btree_header_offset(page_num);
+        let data = pager.get_page(page_num)?.data.clone();
+        let header = BTreePageHeader::parse(&data, header_offset)?;
+
+        if header.page_type.is_leaf() {
+            if header.cell_count == 0 {
+                return Ok(0);
+            }
+            // The last cell in a leaf has the highest rowid.
+            let pointers = read_cell_pointers(&data, header_offset, &header)?;
+            let last_ptr = pointers[pointers.len() - 1] as usize;
+            let usable_size = pager.usable_size();
+            let (cell, _, _) = parse_cell_raw(&data, last_ptr, header.page_type, usable_size)?;
+            return Ok(cell.rowid().unwrap_or(0));
+        }
+
+        // Interior page: go to the rightmost child.
+        page_num = header.right_child;
+        if page_num == 0 {
+            return Ok(0);
+        }
+    }
+}
+
+/// Result of inserting into a subtree.
+enum InsertResult {
+    /// Insertion succeeded without splitting.
+    Ok,
+    /// The page was split. `new_page` is the new right sibling,
+    /// `divider_rowid` is the key to promote to the parent.
+    Split {
+        new_page: PageNumber,
+        divider_rowid: i64,
+    },
+}
+
+/// Insert a cell into the subtree rooted at `page_num`.
+fn insert_into_subtree(
+    pager: &mut Pager,
+    page_num: PageNumber,
+    rowid: i64,
+    cell_data: &[u8],
+) -> Result<InsertResult> {
+    let header_offset = pager::btree_header_offset(page_num);
+    let data = pager.get_page(page_num)?.data.clone();
+    let header = BTreePageHeader::parse(&data, header_offset)?;
+
+    match header.page_type {
+        BTreePageType::TableLeaf => {
+            // Try to insert the cell into this leaf page.
+            let pointers = read_cell_pointers(&data, header_offset, &header)?;
+            let usable_size = pager.usable_size();
+
+            // Find insertion position (maintain rowid order).
+            let mut insert_pos = pointers.len();
+            for (i, &ptr) in pointers.iter().enumerate() {
+                let (cell, _, _) = parse_cell_raw(&data, ptr as usize, header.page_type, usable_size)?;
+                if cell.rowid().unwrap() >= rowid {
+                    insert_pos = i;
+                    break;
+                }
+            }
+
+            // Check if there's space: need 2 bytes for pointer + cell_data.len() for content.
+            let ptr_array_end = header_offset + header.header_size() + (header.cell_count as usize + 1) * 2;
+            let content_start = header.content_offset();
+            let free_space = if content_start > ptr_array_end {
+                content_start - ptr_array_end
+            } else {
+                0
+            };
+
+            if free_space >= 2 + cell_data.len() {
+                // Insert in-place.
+                insert_cell_into_page(pager, page_num, cell_data, insert_pos)?;
+                Ok(InsertResult::Ok)
+            } else {
+                // Need to split.
+                split_leaf_page(pager, page_num, cell_data, rowid, insert_pos)
+            }
+        }
+
+        BTreePageType::TableInterior => {
+            // Find which child to descend into.
+            let pointers = read_cell_pointers(&data, header_offset, &header)?;
+            let usable_size = pager.usable_size();
+
+            let mut child_page = header.right_child;
+            let mut child_index = pointers.len(); // means right_child
+
+            for (i, &ptr) in pointers.iter().enumerate() {
+                let (cell, _, _) = parse_cell_raw(&data, ptr as usize, header.page_type, usable_size)?;
+                let key = cell.rowid().unwrap();
+                if rowid <= key {
+                    child_page = cell.left_child().unwrap();
+                    child_index = i;
+                    break;
+                }
+            }
+
+            // Recurse.
+            let result = insert_into_subtree(pager, child_page, rowid, cell_data)?;
+
+            match result {
+                InsertResult::Ok => Ok(InsertResult::Ok),
+                InsertResult::Split {
+                    new_page,
+                    divider_rowid,
+                } => {
+                    // Insert the divider into this interior page.
+                    // Build interior cell: left_child (4 bytes) + rowid (varint)
+                    let mut int_cell = Vec::new();
+                    int_cell.extend_from_slice(&child_page.to_be_bytes());
+                    let mut tmp = [0u8; 9];
+                    let n = varint::write_varint(&mut tmp, divider_rowid as u64);
+                    int_cell.extend_from_slice(&tmp[..n]);
+
+                    // Re-read page header (may have changed).
+                    let data = pager.get_page(page_num)?.data.clone();
+                    let header = BTreePageHeader::parse(&data, pager::btree_header_offset(page_num))?;
+                    let ptr_array_end = pager::btree_header_offset(page_num) + header.header_size() + (header.cell_count as usize + 1) * 2;
+                    let content_start = header.content_offset();
+                    let free_space = if content_start > ptr_array_end {
+                        content_start - ptr_array_end
+                    } else {
+                        0
+                    };
+
+                    if free_space >= 2 + int_cell.len() {
+                        // Insert the interior cell at child_index.
+                        insert_cell_into_page(pager, page_num, &int_cell, child_index)?;
+
+                        // Update: the child to the right of the new cell should be new_page.
+                        // Actually, we set left_child = child_page in the cell.
+                        // The right sibling is handled by the next cell's left_child or right_child.
+                        // If child_index was the rightmost (pointing to right_child), update right_child.
+                        let header_off = pager::btree_header_offset(page_num);
+                        let page = pager.get_page_mut(page_num)?;
+                        if child_index >= (header.cell_count as usize) {
+                            // The new cell is at the end. new_page becomes right_child.
+                            format::write_be_u32(&mut page.data, header_off + 8, new_page);
+                        } else {
+                            // The new cell was inserted before existing cells.
+                            // The old cell at child_index now has new_page as its left_child.
+                            // We need to update its left_child pointer.
+                            let reread_header = BTreePageHeader::parse(&page.data, header_off)?;
+                            let ptrs = read_cell_pointers(&page.data, header_off, &reread_header)?;
+                            // The cell now at child_index+1 should point to new_page.
+                            let next_cell_offset = ptrs[child_index + 1] as usize;
+                            format::write_be_u32(&mut page.data, next_cell_offset, new_page);
+                        }
+
+                        Ok(InsertResult::Ok)
+                    } else {
+                        // Split the interior page (complex; for now, return error).
+                        Err(RsqliteError::NotImplemented(
+                            "interior page splitting".into(),
+                        ))
+                    }
+                }
+            }
+        }
+
+        _ => Err(RsqliteError::Corrupt(
+            "unexpected page type during insert".into(),
+        )),
+    }
+}
+
+/// Insert a cell into a page at the given position (in the cell pointer array).
+/// Assumes there is enough free space.
+fn insert_cell_into_page(
+    pager: &mut Pager,
+    page_num: PageNumber,
+    cell_data: &[u8],
+    position: usize,
+) -> Result<()> {
+    let header_offset = pager::btree_header_offset(page_num);
+    let page = pager.get_page_mut(page_num)?;
+
+    let header = BTreePageHeader::parse(&page.data, header_offset)?;
+    let cell_count = header.cell_count as usize;
+
+    // Place cell content just before the current content area.
+    let content_start = header.content_offset();
+    let new_content_start = content_start - cell_data.len();
+    page.data[new_content_start..content_start].copy_from_slice(cell_data);
+
+    // Update cell content offset.
+    format::write_be_u16(&mut page.data, header_offset + 5, new_content_start as u16);
+
+    // Update cell count.
+    format::write_be_u16(&mut page.data, header_offset + 3, (cell_count + 1) as u16);
+
+    // Insert cell pointer at the correct position.
+    let ptr_array_start = header_offset + header.header_size();
+    // Shift existing pointers after `position` to the right by 2 bytes.
+    if position < cell_count {
+        let src_start = ptr_array_start + position * 2;
+        let src_end = ptr_array_start + cell_count * 2;
+        // Copy backwards to avoid overlap issues.
+        for i in (src_start..src_end).rev() {
+            page.data[i + 2] = page.data[i];
+        }
+    }
+
+    // Write the new pointer.
+    format::write_be_u16(
+        &mut page.data,
+        ptr_array_start + position * 2,
+        new_content_start as u16,
+    );
+
+    Ok(())
+}
+
+/// Split a leaf page and return the new sibling info.
+fn split_leaf_page(
+    pager: &mut Pager,
+    page_num: PageNumber,
+    new_cell_data: &[u8],
+    new_rowid: i64,
+    insert_pos: usize,
+) -> Result<InsertResult> {
+    // Collect all existing cells + the new cell.
+    let header_offset = pager::btree_header_offset(page_num);
+    let usable_size = pager.usable_size();
+
+    let data = pager.get_page(page_num)?.data.clone();
+    let header = BTreePageHeader::parse(&data, header_offset)?;
+    let pointers = read_cell_pointers(&data, header_offset, &header)?;
+
+    // Collect all cells as (rowid, cell_bytes).
+    let mut all_cells: Vec<(i64, Vec<u8>)> = Vec::with_capacity(pointers.len() + 1);
+
+    for (i, &ptr) in pointers.iter().enumerate() {
+        if i == insert_pos {
+            all_cells.push((new_rowid, new_cell_data.to_vec()));
+        }
+        let (cell, _, _) = parse_cell_raw(&data, ptr as usize, header.page_type, usable_size)?;
+        let cell_rowid = cell.rowid().unwrap();
+        // Re-read the raw cell data from the page.
+        let raw_cell = extract_raw_table_leaf_cell(&data, ptr as usize)?;
+        all_cells.push((cell_rowid, raw_cell));
+    }
+    if insert_pos >= pointers.len() {
+        all_cells.push((new_rowid, new_cell_data.to_vec()));
+    }
+
+    // Split at the midpoint.
+    let mid = all_cells.len() / 2;
+    let divider_rowid = all_cells[mid - 1].0;
+
+    // Left page gets cells [0..mid), right page gets cells [mid..].
+    let left_cells = &all_cells[..mid];
+    let right_cells = &all_cells[mid..];
+
+    // Rewrite the left (original) page.
+    rewrite_leaf_page(pager, page_num, left_cells)?;
+
+    // Create and fill the right (new) page.
+    let new_page_num = pager.allocate_page()?;
+    init_table_leaf_page(pager, new_page_num)?;
+    rewrite_leaf_page(pager, new_page_num, right_cells)?;
+
+    Ok(InsertResult::Split {
+        new_page: new_page_num,
+        divider_rowid,
+    })
+}
+
+/// Extract raw cell bytes for a table leaf cell at the given offset.
+fn extract_raw_table_leaf_cell(data: &[u8], offset: usize) -> Result<Vec<u8>> {
+    let mut pos = offset;
+
+    // payload_length varint
+    let (payload_len, n) = read_varint_checked(data, pos)?;
+    pos += n;
+    let payload_size = payload_len as usize;
+
+    // rowid varint
+    let (_rowid, n) = read_varint_i64_checked(data, pos)?;
+    pos += n;
+
+    // payload bytes (local only, no overflow handling for now)
+    let cell_end = pos + payload_size;
+    if cell_end > data.len() {
+        return Err(RsqliteError::Corrupt("cell extends beyond page".into()));
+    }
+
+    Ok(data[offset..cell_end].to_vec())
+}
+
+/// Rewrite a leaf page with the given cells.
+fn rewrite_leaf_page(
+    pager: &mut Pager,
+    page_num: PageNumber,
+    cells: &[(i64, Vec<u8>)],
+) -> Result<()> {
+    let header_offset = pager::btree_header_offset(page_num);
+    let page = pager.get_page_mut(page_num)?;
+    let page_size = page.data.len();
+
+    // Clear the page (preserve the database header on page 1).
+    let clear_start = header_offset;
+    page.data[clear_start..page_size].fill(0);
+
+    // Write B-tree leaf header.
+    page.data[header_offset] = BTreePageType::TableLeaf.to_flag();
+    format::write_be_u16(&mut page.data, header_offset + 1, 0); // first freeblock
+    format::write_be_u16(&mut page.data, header_offset + 3, cells.len() as u16);
+    page.data[header_offset + 7] = 0;
+
+    // Place cells from end of page backward.
+    let mut content_end = page_size;
+    let ptr_array_start = header_offset + 8; // leaf header = 8 bytes
+
+    for (i, (_rowid, cell_data)) in cells.iter().enumerate() {
+        content_end -= cell_data.len();
+        page.data[content_end..content_end + cell_data.len()].copy_from_slice(cell_data);
+        format::write_be_u16(&mut page.data, ptr_array_start + i * 2, content_end as u16);
+    }
+
+    // Cell content offset.
+    format::write_be_u16(&mut page.data, header_offset + 5, content_end as u16);
+
+    Ok(())
+}
+
+/// Delete a row from a table B-tree by rowid.
+/// Returns true if the row was found and deleted.
+pub fn btree_delete(
+    pager: &mut Pager,
+    root_page: PageNumber,
+    rowid: i64,
+) -> Result<bool> {
+    delete_from_subtree(pager, root_page, rowid)
+}
+
+/// Delete a cell with the given rowid from the subtree rooted at `page_num`.
+fn delete_from_subtree(
+    pager: &mut Pager,
+    page_num: PageNumber,
+    rowid: i64,
+) -> Result<bool> {
+    let header_offset = pager::btree_header_offset(page_num);
+    let data = pager.get_page(page_num)?.data.clone();
+    let header = BTreePageHeader::parse(&data, header_offset)?;
+    let usable_size = pager.usable_size();
+
+    match header.page_type {
+        BTreePageType::TableLeaf => {
+            let pointers = read_cell_pointers(&data, header_offset, &header)?;
+
+            // Find the cell with matching rowid.
+            for (i, &ptr) in pointers.iter().enumerate() {
+                let (cell, _, _) = parse_cell_raw(&data, ptr as usize, header.page_type, usable_size)?;
+                if cell.rowid() == Some(rowid) {
+                    // Remove this cell by collecting all others and rewriting.
+                    let mut remaining_cells: Vec<(i64, Vec<u8>)> = Vec::new();
+                    for (j, &p) in pointers.iter().enumerate() {
+                        if j == i {
+                            continue;
+                        }
+                        let (c, _, _) = parse_cell_raw(&data, p as usize, header.page_type, usable_size)?;
+                        let raw = extract_raw_table_leaf_cell(&data, p as usize)?;
+                        remaining_cells.push((c.rowid().unwrap(), raw));
+                    }
+                    rewrite_leaf_page(pager, page_num, &remaining_cells)?;
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+
+        BTreePageType::TableInterior => {
+            let pointers = read_cell_pointers(&data, header_offset, &header)?;
+
+            // Find which child to descend into.
+            for &ptr in pointers.iter() {
+                let (cell, _, _) = parse_cell_raw(&data, ptr as usize, header.page_type, usable_size)?;
+                let key = cell.rowid().unwrap();
+                if rowid <= key {
+                    let child = cell.left_child().unwrap();
+                    return delete_from_subtree(pager, child, rowid);
+                }
+            }
+            // rowid > all keys, descend into right_child.
+            if header.right_child != 0 {
+                delete_from_subtree(pager, header.right_child, rowid)
+            } else {
+                Ok(false)
+            }
+        }
+
+        _ => Err(RsqliteError::Corrupt("unexpected page type during delete".into())),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

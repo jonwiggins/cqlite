@@ -8,9 +8,11 @@
 //
 // Column names are extracted from CREATE TABLE SQL in the schema entries.
 
-use crate::ast::Statement;
+use crate::ast::{Expr, InsertSource, LiteralValue, Statement};
+use crate::btree;
 use crate::error::{Result, RsqliteError};
 use crate::pager::Pager;
+use crate::record;
 use crate::schema::{self, SchemaEntry};
 use crate::types::Value;
 use crate::vm::{self, ColumnInfo, QueryResult, Row, TableSchema};
@@ -49,8 +51,12 @@ impl Database {
                 let table_schemas = build_table_schemas(&schema_entries)?;
                 vm::execute_select(&mut self.pager, select, &table_schemas)
             }
+            Statement::CreateTable(ct) => self.execute_create_table(ct),
+            Statement::Insert(insert) => self.execute_insert(insert),
+            Statement::Delete(delete) => self.execute_delete(delete),
+            Statement::Update(update) => self.execute_update(update),
+            Statement::DropTable(drop) => self.execute_drop_table(drop),
             Statement::Explain(inner) => {
-                // Simple EXPLAIN: show the statement type
                 let description = format!("{inner:?}");
                 Ok(QueryResult {
                     columns: vec![ColumnInfo {
@@ -67,6 +73,383 @@ impl Database {
                 "statement type: {stmt:?}"
             ))),
         }
+    }
+
+    /// Execute a CREATE TABLE statement.
+    fn execute_create_table(
+        &mut self,
+        ct: &crate::ast::CreateTableStatement,
+    ) -> Result<QueryResult> {
+        // Check if the table already exists.
+        let schema_entries = schema::read_schema(&mut self.pager)?;
+        if schema::find_table(&schema_entries, &ct.name).is_some() {
+            if ct.if_not_exists {
+                return Ok(empty_result());
+            }
+            return Err(RsqliteError::Runtime(format!(
+                "table {} already exists",
+                ct.name
+            )));
+        }
+
+        // Allocate a new page for the table's root B-tree.
+        let root_page = self.pager.allocate_page()?;
+        btree::init_table_leaf_page(&mut self.pager, root_page)?;
+
+        // Reconstruct the CREATE TABLE SQL from the AST.
+        let sql = reconstruct_create_table_sql(ct);
+
+        // Insert a row into sqlite_master (the table B-tree on page 1).
+        // sqlite_master columns: type, name, tbl_name, rootpage, sql
+        let master_values = vec![
+            Value::Text("table".into()),
+            Value::Text(ct.name.clone()),
+            Value::Text(ct.name.clone()),
+            Value::Integer(root_page as i64),
+            Value::Text(sql),
+        ];
+        let master_payload = record::encode_record(&master_values);
+
+        // Find the next rowid for sqlite_master.
+        let master_rowid = btree::find_max_rowid(&mut self.pager, 1)? + 1;
+
+        // Insert into page 1 (sqlite_master).
+        let new_root = btree::btree_insert(&mut self.pager, 1, master_rowid, &master_payload)?;
+        if new_root != 1 {
+            // sqlite_master's root must stay on page 1. This would be a serious issue.
+            return Err(RsqliteError::Runtime(
+                "sqlite_master root page split is not yet supported".into(),
+            ));
+        }
+
+        // Increment schema cookie.
+        self.pager.header.schema_cookie += 1;
+
+        // Flush to disk.
+        self.pager.flush()?;
+
+        Ok(empty_result())
+    }
+
+    /// Execute an INSERT statement.
+    fn execute_insert(
+        &mut self,
+        insert: &crate::ast::InsertStatement,
+    ) -> Result<QueryResult> {
+        // Look up the table schema.
+        let schema_entries = schema::read_schema(&mut self.pager)?;
+        let table_schemas = build_table_schemas(&schema_entries)?;
+        let schema = table_schemas
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(&insert.table))
+            .ok_or_else(|| {
+                RsqliteError::Runtime(format!("no such table: {}", insert.table))
+            })?
+            .clone();
+
+        let rows = match &insert.source {
+            InsertSource::Values(row_list) => {
+                let mut result_rows = Vec::new();
+                for value_exprs in row_list {
+                    let values = eval_insert_values(value_exprs)?;
+                    result_rows.push(values);
+                }
+                result_rows
+            }
+            InsertSource::DefaultValues => {
+                // Single row of all defaults (NULLs).
+                let values: Vec<Value> = schema.columns.iter().map(|_| Value::Null).collect();
+                vec![values]
+            }
+            InsertSource::Select(_) => {
+                return Err(RsqliteError::NotImplemented(
+                    "INSERT ... SELECT".into(),
+                ));
+            }
+        };
+
+        let mut changes = 0i64;
+        let mut root_page = schema.root_page;
+
+        for mut values in rows {
+            // Map columns if specified.
+            if let Some(ref target_cols) = insert.columns {
+                let mut full_values = vec![Value::Null; schema.columns.len()];
+                for (i, col_name) in target_cols.iter().enumerate() {
+                    if let Some(col_idx) = schema
+                        .columns
+                        .iter()
+                        .position(|c| c.eq_ignore_ascii_case(col_name))
+                    {
+                        if i < values.len() {
+                            full_values[col_idx] = values[i].clone();
+                        }
+                    } else {
+                        return Err(RsqliteError::Runtime(format!(
+                            "table {} has no column named {}",
+                            insert.table, col_name
+                        )));
+                    }
+                }
+                values = full_values;
+            }
+
+            // Pad or truncate to match column count.
+            values.resize(schema.columns.len(), Value::Null);
+
+            // Determine rowid.
+            let rowid = if let Some(pk_idx) = schema.rowid_column {
+                match &values[pk_idx] {
+                    Value::Integer(id) => {
+                        // Use the provided INTEGER PRIMARY KEY value as rowid.
+                        let id = *id;
+                        // Store NULL in the record for the IPK column.
+                        values[pk_idx] = Value::Null;
+                        id
+                    }
+                    Value::Null => {
+                        // Auto-assign rowid.
+                        let id = btree::find_max_rowid(&mut self.pager, root_page)? + 1;
+                        // Keep NULL in the record.
+                        id
+                    }
+                    _ => {
+                        // Try to convert to integer.
+                        let id = btree::find_max_rowid(&mut self.pager, root_page)? + 1;
+                        values[pk_idx] = Value::Null;
+                        id
+                    }
+                }
+            } else {
+                btree::find_max_rowid(&mut self.pager, root_page)? + 1
+            };
+
+            let payload = record::encode_record(&values);
+            let new_root = btree::btree_insert(&mut self.pager, root_page, rowid, &payload)?;
+
+            // If the root changed due to a split, update the schema.
+            if new_root != root_page {
+                update_root_page(&mut self.pager, &schema.name, new_root)?;
+                root_page = new_root;
+            }
+
+            changes += 1;
+        }
+
+        self.pager.flush()?;
+
+        Ok(QueryResult {
+            columns: vec![],
+            rows: vec![Row {
+                values: vec![Value::Integer(changes)],
+            }],
+        })
+    }
+
+    /// Execute a DELETE statement.
+    fn execute_delete(
+        &mut self,
+        delete: &crate::ast::DeleteStatement,
+    ) -> Result<QueryResult> {
+        let schema_entries = schema::read_schema(&mut self.pager)?;
+        let table_schemas = build_table_schemas(&schema_entries)?;
+        let schema = table_schemas
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(&delete.table))
+            .ok_or_else(|| {
+                RsqliteError::Runtime(format!("no such table: {}", delete.table))
+            })?
+            .clone();
+
+        // Scan to find rows matching the WHERE clause.
+        let column_names: Vec<&str> = schema.columns.iter().map(|c| c.as_str()).collect();
+        let table_name = Some(schema.name.as_str());
+
+        let mut to_delete: Vec<i64> = Vec::new();
+        let mut cursor = btree::BTreeCursor::new(schema.root_page);
+        cursor.move_to_first(&mut self.pager)?;
+
+        while cursor.is_valid() {
+            let rowid = cursor.current_rowid(&mut self.pager)?;
+            let payload = cursor.current_payload(&mut self.pager)?;
+            let mut values = record::decode_record(&payload)?;
+
+            if let Some(pk_idx) = schema.rowid_column {
+                if pk_idx < values.len() {
+                    values[pk_idx] = Value::Integer(rowid);
+                }
+            }
+
+            let should_delete = if let Some(ref where_expr) = delete.where_clause {
+                let result = vm::eval_expr(where_expr, &column_names, &values, rowid, table_name)?;
+                result.is_truthy()
+            } else {
+                true
+            };
+
+            if should_delete {
+                to_delete.push(rowid);
+            }
+            cursor.move_to_next(&mut self.pager)?;
+        }
+
+        let changes = to_delete.len() as i64;
+        for rowid in to_delete {
+            btree::btree_delete(&mut self.pager, schema.root_page, rowid)?;
+        }
+
+        self.pager.flush()?;
+
+        Ok(QueryResult {
+            columns: vec![],
+            rows: vec![Row {
+                values: vec![Value::Integer(changes)],
+            }],
+        })
+    }
+
+    /// Execute an UPDATE statement.
+    fn execute_update(
+        &mut self,
+        update: &crate::ast::UpdateStatement,
+    ) -> Result<QueryResult> {
+        let schema_entries = schema::read_schema(&mut self.pager)?;
+        let table_schemas = build_table_schemas(&schema_entries)?;
+        let schema = table_schemas
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(&update.table))
+            .ok_or_else(|| {
+                RsqliteError::Runtime(format!("no such table: {}", update.table))
+            })?
+            .clone();
+
+        let column_names: Vec<&str> = schema.columns.iter().map(|c| c.as_str()).collect();
+        let table_name = Some(schema.name.as_str());
+
+        // Scan all rows and collect those that match.
+        let mut updates: Vec<(i64, Vec<Value>)> = Vec::new();
+        let mut cursor = btree::BTreeCursor::new(schema.root_page);
+        cursor.move_to_first(&mut self.pager)?;
+
+        while cursor.is_valid() {
+            let rowid = cursor.current_rowid(&mut self.pager)?;
+            let payload = cursor.current_payload(&mut self.pager)?;
+            let mut values = record::decode_record(&payload)?;
+
+            if let Some(pk_idx) = schema.rowid_column {
+                if pk_idx < values.len() {
+                    values[pk_idx] = Value::Integer(rowid);
+                }
+            }
+
+            let should_update = if let Some(ref where_expr) = update.where_clause {
+                let result = vm::eval_expr(where_expr, &column_names, &values, rowid, table_name)?;
+                result.is_truthy()
+            } else {
+                true
+            };
+
+            if should_update {
+                // Apply assignments.
+                for assignment in &update.assignments {
+                    if let Some(col_idx) = schema
+                        .columns
+                        .iter()
+                        .position(|c| c.eq_ignore_ascii_case(&assignment.column))
+                    {
+                        let new_val = vm::eval_expr(
+                            &assignment.value,
+                            &column_names,
+                            &values,
+                            rowid,
+                            table_name,
+                        )?;
+                        values[col_idx] = new_val;
+                    }
+                }
+                updates.push((rowid, values));
+            }
+            cursor.move_to_next(&mut self.pager)?;
+        }
+
+        let changes = updates.len() as i64;
+        let mut root_page = schema.root_page;
+
+        for (rowid, mut values) in updates {
+            // Delete old row.
+            btree::btree_delete(&mut self.pager, root_page, rowid)?;
+
+            // For INTEGER PRIMARY KEY columns, store NULL in the record.
+            if let Some(pk_idx) = schema.rowid_column {
+                if pk_idx < values.len() {
+                    values[pk_idx] = Value::Null;
+                }
+            }
+
+            // Re-insert with same rowid.
+            let payload = record::encode_record(&values);
+            let new_root = btree::btree_insert(&mut self.pager, root_page, rowid, &payload)?;
+            if new_root != root_page {
+                update_root_page(&mut self.pager, &schema.name, new_root)?;
+                root_page = new_root;
+            }
+        }
+
+        self.pager.flush()?;
+
+        Ok(QueryResult {
+            columns: vec![],
+            rows: vec![Row {
+                values: vec![Value::Integer(changes)],
+            }],
+        })
+    }
+
+    /// Execute a DROP TABLE statement.
+    fn execute_drop_table(
+        &mut self,
+        drop: &crate::ast::DropTableStatement,
+    ) -> Result<QueryResult> {
+        let schema_entries = schema::read_schema(&mut self.pager)?;
+
+        if schema::find_table(&schema_entries, &drop.name).is_none() {
+            if drop.if_exists {
+                return Ok(empty_result());
+            }
+            return Err(RsqliteError::Runtime(format!(
+                "no such table: {}",
+                drop.name
+            )));
+        }
+
+        // Find and delete the sqlite_master entry.
+        let mut cursor = btree::BTreeCursor::new(1);
+        cursor.move_to_first(&mut self.pager)?;
+
+        let mut rowid_to_delete = None;
+        while cursor.is_valid() {
+            let rowid = cursor.current_rowid(&mut self.pager)?;
+            let payload = cursor.current_payload(&mut self.pager)?;
+            let values = record::decode_record(&payload)?;
+            if values.len() >= 2 {
+                if let Value::Text(ref name) = values[1] {
+                    if name.eq_ignore_ascii_case(&drop.name) {
+                        rowid_to_delete = Some(rowid);
+                        break;
+                    }
+                }
+            }
+            cursor.move_to_next(&mut self.pager)?;
+        }
+
+        if let Some(rowid) = rowid_to_delete {
+            btree::btree_delete(&mut self.pager, 1, rowid)?;
+        }
+
+        self.pager.header.schema_cookie += 1;
+        self.pager.flush()?;
+
+        Ok(empty_result())
     }
 
     /// Read the database schema (all entries from sqlite_master).
@@ -271,6 +654,149 @@ fn extract_first_identifier(s: &str) -> Option<String> {
     } else {
         Some(s[..end].to_string())
     }
+}
+
+/// Create an empty QueryResult (for DDL statements that don't return rows).
+fn empty_result() -> QueryResult {
+    QueryResult {
+        columns: vec![],
+        rows: vec![],
+    }
+}
+
+/// Evaluate a list of expressions into values for INSERT.
+fn eval_insert_values(exprs: &[Expr]) -> Result<Vec<Value>> {
+    let mut values = Vec::with_capacity(exprs.len());
+    for expr in exprs {
+        let value = eval_constant_expr(expr)?;
+        values.push(value);
+    }
+    Ok(values)
+}
+
+/// Evaluate a constant expression (no column references).
+fn eval_constant_expr(expr: &Expr) -> Result<Value> {
+    match expr {
+        Expr::Literal(lit) => match lit {
+            LiteralValue::Integer(i) => Ok(Value::Integer(*i)),
+            LiteralValue::Real(f) => Ok(Value::Real(*f)),
+            LiteralValue::String(s) => Ok(Value::Text(s.clone())),
+            LiteralValue::Blob(b) => Ok(Value::Blob(b.clone())),
+            LiteralValue::Null => Ok(Value::Null),
+            _ => Ok(Value::Null),
+        },
+        Expr::UnaryOp {
+            op: crate::ast::UnaryOp::Negate,
+            operand,
+        } => {
+            let val = eval_constant_expr(operand)?;
+            match val {
+                Value::Integer(i) => Ok(Value::Integer(-i)),
+                Value::Real(f) => Ok(Value::Real(-f)),
+                _ => Ok(Value::Null),
+            }
+        }
+        _ => {
+            // For complex expressions, try evaluating with no column context.
+            vm::eval_expr(expr, &[], &[], 0, None)
+        }
+    }
+}
+
+/// Reconstruct CREATE TABLE SQL from the AST.
+fn reconstruct_create_table_sql(ct: &crate::ast::CreateTableStatement) -> String {
+    let mut sql = String::from("CREATE TABLE ");
+    sql.push_str(&ct.name);
+    sql.push_str(" (");
+
+    for (i, col) in ct.columns.iter().enumerate() {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str(&col.name);
+        if let Some(ref type_name) = col.type_name {
+            sql.push(' ');
+            sql.push_str(type_name);
+        }
+        for constraint in &col.constraints {
+            match constraint {
+                crate::ast::ColumnConstraint::PrimaryKey { autoincrement, .. } => {
+                    sql.push_str(" PRIMARY KEY");
+                    if *autoincrement {
+                        sql.push_str(" AUTOINCREMENT");
+                    }
+                }
+                crate::ast::ColumnConstraint::NotNull => sql.push_str(" NOT NULL"),
+                crate::ast::ColumnConstraint::Unique => sql.push_str(" UNIQUE"),
+                crate::ast::ColumnConstraint::Default(expr) => {
+                    sql.push_str(" DEFAULT ");
+                    sql.push_str(&format!("{expr:?}"));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Table constraints.
+    for constraint in &ct.constraints {
+        sql.push_str(", ");
+        match constraint {
+            crate::ast::TableConstraint::PrimaryKey(cols) => {
+                sql.push_str("PRIMARY KEY (");
+                for (i, col) in cols.iter().enumerate() {
+                    if i > 0 {
+                        sql.push_str(", ");
+                    }
+                    sql.push_str(&col.name);
+                }
+                sql.push(')');
+            }
+            crate::ast::TableConstraint::Unique(cols) => {
+                sql.push_str("UNIQUE (");
+                for (i, col) in cols.iter().enumerate() {
+                    if i > 0 {
+                        sql.push_str(", ");
+                    }
+                    sql.push_str(&col.name);
+                }
+                sql.push(')');
+            }
+            _ => {}
+        }
+    }
+
+    sql.push(')');
+    sql
+}
+
+/// Update the root page number for a table in sqlite_master.
+fn update_root_page(pager: &mut Pager, table_name: &str, new_root: u32) -> Result<()> {
+    let mut cursor = btree::BTreeCursor::new(1);
+    cursor.move_to_first(pager)?;
+
+    while cursor.is_valid() {
+        let rowid = cursor.current_rowid(pager)?;
+        let payload = cursor.current_payload(pager)?;
+        let mut values = record::decode_record(&payload)?;
+
+        if values.len() >= 4 {
+            if let Value::Text(ref name) = values[1] {
+                if name.eq_ignore_ascii_case(table_name) {
+                    // Update rootpage (column 3, 0-indexed).
+                    values[3] = Value::Integer(new_root as i64);
+                    let new_payload = record::encode_record(&values);
+
+                    // Delete and re-insert.
+                    btree::btree_delete(pager, 1, rowid)?;
+                    btree::btree_insert(pager, 1, rowid, &new_payload)?;
+                    return Ok(());
+                }
+            }
+        }
+        cursor.move_to_next(pager)?;
+    }
+
+    Ok(())
 }
 
 /// Execute a PRAGMA statement.
@@ -781,5 +1307,278 @@ mod tests {
             .unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].values[0], Value::Text("WIDGET".into()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Write path tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_table_in_memory() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)")
+            .unwrap();
+
+        let tables = db.table_names().unwrap();
+        assert_eq!(tables, vec!["users"]);
+
+        // Table should be empty.
+        let result = db.execute("SELECT * FROM users").unwrap();
+        assert_eq!(result.rows.len(), 0);
+        assert_eq!(result.columns.len(), 3);
+    }
+
+    #[test]
+    fn test_create_table_if_not_exists() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (a INT)").unwrap();
+        // Should not error with IF NOT EXISTS.
+        db.execute("CREATE TABLE IF NOT EXISTS t (a INT)").unwrap();
+        // Should error without IF NOT EXISTS.
+        let result = db.execute("CREATE TABLE t (a INT)");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_insert_and_select() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)")
+            .unwrap();
+
+        db.execute("INSERT INTO users VALUES (1, 'Alice', 30)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob', 25)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (3, 'Charlie', 35)")
+            .unwrap();
+
+        let result = db.execute("SELECT * FROM users").unwrap();
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(result.rows[0].values[0], Value::Integer(1));
+        assert_eq!(result.rows[0].values[1], Value::Text("Alice".into()));
+        assert_eq!(result.rows[0].values[2], Value::Integer(30));
+        assert_eq!(result.rows[1].values[0], Value::Integer(2));
+        assert_eq!(result.rows[2].values[0], Value::Integer(3));
+    }
+
+    #[test]
+    fn test_insert_with_column_names() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (a TEXT, b INTEGER, c REAL)")
+            .unwrap();
+
+        db.execute("INSERT INTO t (b, a) VALUES (42, 'hello')")
+            .unwrap();
+
+        let result = db.execute("SELECT a, b, c FROM t").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values[0], Value::Text("hello".into()));
+        assert_eq!(result.rows[0].values[1], Value::Integer(42));
+        assert_eq!(result.rows[0].values[2], Value::Null);
+    }
+
+    #[test]
+    fn test_insert_auto_rowid() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (name TEXT, value INTEGER)")
+            .unwrap();
+
+        db.execute("INSERT INTO t VALUES ('a', 1)").unwrap();
+        db.execute("INSERT INTO t VALUES ('b', 2)").unwrap();
+
+        let result = db.execute("SELECT rowid, name FROM t").unwrap();
+        assert_eq!(result.rows.len(), 2);
+        // Rowids should be 1 and 2.
+        assert_eq!(result.rows[0].values[0], Value::Integer(1));
+        assert_eq!(result.rows[1].values[0], Value::Integer(2));
+    }
+
+    #[test]
+    fn test_insert_multi_row() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (x INTEGER)").unwrap();
+
+        db.execute("INSERT INTO t VALUES (10), (20), (30)")
+            .unwrap();
+
+        let result = db.execute("SELECT x FROM t").unwrap();
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(result.rows[0].values[0], Value::Integer(10));
+        assert_eq!(result.rows[1].values[0], Value::Integer(20));
+        assert_eq!(result.rows[2].values[0], Value::Integer(30));
+    }
+
+    #[test]
+    fn test_delete_with_where() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
+
+        db.execute("DELETE FROM t WHERE id = 2").unwrap();
+
+        let result = db.execute("SELECT * FROM t").unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].values[0], Value::Integer(1));
+        assert_eq!(result.rows[1].values[0], Value::Integer(3));
+    }
+
+    #[test]
+    fn test_delete_all() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (x INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1)").unwrap();
+        db.execute("INSERT INTO t VALUES (2)").unwrap();
+
+        db.execute("DELETE FROM t").unwrap();
+
+        let result = db.execute("SELECT * FROM t").unwrap();
+        assert_eq!(result.rows.len(), 0);
+    }
+
+    #[test]
+    fn test_update_with_where() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'Alice', 80)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'Bob', 90)")
+            .unwrap();
+
+        db.execute("UPDATE t SET score = 95 WHERE id = 1")
+            .unwrap();
+
+        let result = db.execute("SELECT * FROM t ORDER BY id").unwrap();
+        assert_eq!(result.rows[0].values[2], Value::Integer(95));
+        assert_eq!(result.rows[1].values[2], Value::Integer(90));
+    }
+
+    #[test]
+    fn test_update_all() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (x INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1)").unwrap();
+        db.execute("INSERT INTO t VALUES (2)").unwrap();
+
+        db.execute("UPDATE t SET x = x + 10").unwrap();
+
+        let result = db.execute("SELECT x FROM t ORDER BY x").unwrap();
+        assert_eq!(result.rows[0].values[0], Value::Integer(11));
+        assert_eq!(result.rows[1].values[0], Value::Integer(12));
+    }
+
+    #[test]
+    fn test_drop_table() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t1 (a INT)").unwrap();
+        db.execute("CREATE TABLE t2 (b INT)").unwrap();
+
+        let tables = db.table_names().unwrap();
+        assert_eq!(tables.len(), 2);
+
+        db.execute("DROP TABLE t1").unwrap();
+
+        let tables = db.table_names().unwrap();
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0], "t2");
+    }
+
+    #[test]
+    fn test_drop_table_if_exists() {
+        let mut db = Database::in_memory();
+        // Should not error.
+        db.execute("DROP TABLE IF EXISTS nonexistent").unwrap();
+        // Should error without IF EXISTS.
+        assert!(db.execute("DROP TABLE nonexistent").is_err());
+    }
+
+    #[test]
+    fn test_insert_select_aggregate() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE scores (name TEXT, score INTEGER)")
+            .unwrap();
+        db.execute("INSERT INTO scores VALUES ('Alice', 90)")
+            .unwrap();
+        db.execute("INSERT INTO scores VALUES ('Bob', 85)")
+            .unwrap();
+        db.execute("INSERT INTO scores VALUES ('Alice', 95)")
+            .unwrap();
+
+        let result = db
+            .execute("SELECT name, AVG(score) FROM scores GROUP BY name ORDER BY name")
+            .unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].values[0], Value::Text("Alice".into()));
+        assert_eq!(result.rows[1].values[0], Value::Text("Bob".into()));
+    }
+
+    #[test]
+    fn test_write_and_read_with_sqlite3() {
+        use std::process::Command;
+
+        let check = Command::new("sqlite3").arg("--version").output();
+        if check.is_err() || !check.unwrap().status.success() {
+            eprintln!("sqlite3 not found, skipping cross-compatibility test");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_write_compat.db");
+
+        // Create and populate using our engine.
+        {
+            let mut db = Database::open(&db_path).unwrap();
+            db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price REAL)")
+                .unwrap();
+            db.execute("INSERT INTO items VALUES (1, 'Widget', 9.99)")
+                .unwrap();
+            db.execute("INSERT INTO items VALUES (2, 'Gadget', 24.99)")
+                .unwrap();
+            db.execute("INSERT INTO items VALUES (3, 'Doohickey', 4.99)")
+                .unwrap();
+        }
+
+        // Read with sqlite3 and verify.
+        let output = Command::new("sqlite3")
+            .arg(db_path.to_str().unwrap())
+            .arg("SELECT id, name, price FROM items ORDER BY id;")
+            .output()
+            .unwrap();
+
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let lines: Vec<&str> = stdout.trim().lines().collect();
+        assert_eq!(lines.len(), 3, "sqlite3 output: {stdout}");
+        assert!(lines[0].contains("Widget"), "expected Widget in: {}", lines[0]);
+        assert!(lines[1].contains("Gadget"), "expected Gadget in: {}", lines[1]);
+        assert!(lines[2].contains("Doohickey"), "expected Doohickey in: {}", lines[2]);
+    }
+
+    #[test]
+    fn test_many_inserts_causes_split() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE big (id INTEGER PRIMARY KEY, data TEXT)")
+            .unwrap();
+
+        // Insert enough rows that the page should split.
+        for i in 1..=100 {
+            let sql = format!(
+                "INSERT INTO big VALUES ({i}, '{}')",
+                "x".repeat(20)
+            );
+            db.execute(&sql).unwrap();
+        }
+
+        let result = db.execute("SELECT COUNT(*) FROM big").unwrap();
+        assert_eq!(result.rows[0].values[0], Value::Integer(100));
+
+        // Verify ordering.
+        let result = db.execute("SELECT id FROM big ORDER BY id").unwrap();
+        assert_eq!(result.rows.len(), 100);
+        for (i, row) in result.rows.iter().enumerate() {
+            assert_eq!(row.values[0], Value::Integer(i as i64 + 1));
+        }
     }
 }

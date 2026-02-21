@@ -76,13 +76,22 @@ impl Pager {
             file.read_exact(&mut buf)?;
             DatabaseHeader::parse(&buf)?
         } else {
-            // New database: write a fresh header.
+            // New database: write a fresh header and initialize page 1 as
+            // an empty table leaf page for sqlite_master.
             let header = DatabaseHeader::new();
             let mut buf = [0u8; HEADER_SIZE];
             header.write(&mut buf);
-            // Write a full first page (header + zeros).
-            let mut page = vec![0u8; header.page_size as usize];
+            let page_size = header.page_size as usize;
+            let mut page = vec![0u8; page_size];
             page[..HEADER_SIZE].copy_from_slice(&buf);
+
+            // B-tree header for sqlite_master at offset 100.
+            page[HEADER_SIZE] = 0x0D; // TableLeaf
+            format::write_be_u16(&mut page, HEADER_SIZE + 1, 0);
+            format::write_be_u16(&mut page, HEADER_SIZE + 3, 0);
+            format::write_be_u16(&mut page, HEADER_SIZE + 5, page_size as u16);
+            page[HEADER_SIZE + 7] = 0;
+
             file.seek(SeekFrom::Start(0))?;
             file.write_all(&page)?;
             file.sync_all()?;
@@ -112,6 +121,14 @@ impl Pager {
         let mut hdr_buf = [0u8; HEADER_SIZE];
         header.write(&mut hdr_buf);
         page1.data[..HEADER_SIZE].copy_from_slice(&hdr_buf);
+
+        // Initialize the B-tree header for sqlite_master (empty table leaf page).
+        // The B-tree header starts at offset 100 on page 1.
+        page1.data[HEADER_SIZE] = 0x0D; // TableLeaf
+        format::write_be_u16(&mut page1.data, HEADER_SIZE + 1, 0); // first freeblock
+        format::write_be_u16(&mut page1.data, HEADER_SIZE + 3, 0); // cell count
+        format::write_be_u16(&mut page1.data, HEADER_SIZE + 5, page_size as u16); // cell content offset
+        page1.data[HEADER_SIZE + 7] = 0; // fragmented free bytes
 
         let mut cache = HashMap::new();
         cache.insert(1, page1);

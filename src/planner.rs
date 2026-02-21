@@ -21,19 +21,25 @@ use std::path::Path;
 /// Top-level database handle. Owns the pager and provides SQL execution.
 pub struct Database {
     pub pager: Pager,
+    /// Whether we are inside an explicit transaction (BEGIN was called).
+    in_transaction: bool,
 }
 
 impl Database {
     /// Open an existing database file (or create a new one).
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let pager = Pager::open(path)?;
-        Ok(Self { pager })
+        Ok(Self {
+            pager,
+            in_transaction: false,
+        })
     }
 
     /// Create an in-memory database.
     pub fn in_memory() -> Self {
         Self {
             pager: Pager::in_memory(),
+            in_transaction: false,
         }
     }
 
@@ -51,13 +57,16 @@ impl Database {
                 let table_schemas = build_table_schemas(&schema_entries)?;
                 vm::execute_select(&mut self.pager, select, &table_schemas)
             }
-            Statement::CreateTable(ct) => self.execute_create_table(ct),
-            Statement::Insert(insert) => self.execute_insert(insert),
-            Statement::Delete(delete) => self.execute_delete(delete),
-            Statement::Update(update) => self.execute_update(update),
-            Statement::DropTable(drop) => self.execute_drop_table(drop),
-            Statement::CreateIndex(ci) => self.execute_create_index(ci),
-            Statement::DropIndex(di) => self.execute_drop_index(di),
+            Statement::Begin(_) => self.execute_begin(),
+            Statement::Commit => self.execute_commit(),
+            Statement::Rollback => self.execute_rollback(),
+            Statement::CreateTable(ct) => self.execute_write(|db| db.execute_create_table(ct)),
+            Statement::Insert(insert) => self.execute_write(|db| db.execute_insert(insert)),
+            Statement::Delete(delete) => self.execute_write(|db| db.execute_delete(delete)),
+            Statement::Update(update) => self.execute_write(|db| db.execute_update(update)),
+            Statement::DropTable(drop) => self.execute_write(|db| db.execute_drop_table(drop)),
+            Statement::CreateIndex(ci) => self.execute_write(|db| db.execute_create_index(ci)),
+            Statement::DropIndex(di) => self.execute_write(|db| db.execute_drop_index(di)),
             Statement::Explain(inner) => {
                 let description = format!("{inner:?}");
                 Ok(QueryResult {
@@ -75,6 +84,70 @@ impl Database {
                 "statement type: {stmt:?}"
             ))),
         }
+    }
+
+    /// Execute a write operation with auto-commit semantics.
+    /// If not in an explicit transaction, wraps the operation in an implicit one.
+    fn execute_write<F>(&mut self, f: F) -> Result<QueryResult>
+    where
+        F: FnOnce(&mut Self) -> Result<QueryResult>,
+    {
+        if self.in_transaction {
+            // Already in explicit transaction — just execute.
+            f(self)
+        } else {
+            // Auto-commit: begin, execute, commit (or rollback on error).
+            let pc = self.pager.header.page_count;
+            self.pager.journal.begin_with_page_count(pc)?;
+            match f(self) {
+                Ok(result) => {
+                    self.pager.journal.commit()?;
+                    Ok(result)
+                }
+                Err(e) => {
+                    self.pager.rollback()?;
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// Execute BEGIN.
+    fn execute_begin(&mut self) -> Result<QueryResult> {
+        if self.in_transaction {
+            return Err(RsqliteError::Runtime(
+                "cannot start a transaction within a transaction".into(),
+            ));
+        }
+        let pc = self.pager.header.page_count;
+        self.pager.journal.begin_with_page_count(pc)?;
+        self.in_transaction = true;
+        Ok(empty_result())
+    }
+
+    /// Execute COMMIT.
+    fn execute_commit(&mut self) -> Result<QueryResult> {
+        if !self.in_transaction {
+            return Err(RsqliteError::Runtime(
+                "cannot commit - no transaction is active".into(),
+            ));
+        }
+        self.pager.flush()?;
+        self.pager.journal.commit()?;
+        self.in_transaction = false;
+        Ok(empty_result())
+    }
+
+    /// Execute ROLLBACK.
+    fn execute_rollback(&mut self) -> Result<QueryResult> {
+        if !self.in_transaction {
+            return Err(RsqliteError::Runtime(
+                "cannot rollback - no transaction is active".into(),
+            ));
+        }
+        self.pager.rollback()?;
+        self.in_transaction = false;
+        Ok(empty_result())
     }
 
     /// Execute a CREATE TABLE statement.
@@ -2645,5 +2718,125 @@ mod tests {
             cursor.move_to_next(&mut db.pager).unwrap();
         }
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_begin_commit() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+        db.execute("COMMIT").unwrap();
+
+        let r = db.execute("SELECT val FROM t ORDER BY id").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0].values[0], Value::Text("a".into()));
+        assert_eq!(r.rows[1].values[0], Value::Text("b".into()));
+    }
+
+    #[test]
+    fn test_rollback_discards_changes() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'original')").unwrap();
+
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'should_be_gone')")
+            .unwrap();
+        db.execute("UPDATE t SET val = 'modified' WHERE id = 1")
+            .unwrap();
+        db.execute("ROLLBACK").unwrap();
+
+        let r = db.execute("SELECT val FROM t ORDER BY id").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].values[0], Value::Text("original".into()));
+    }
+
+    #[test]
+    fn test_auto_commit_on_error() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'one')").unwrap();
+
+        // This should auto-rollback because the table already exists.
+        let _ = db.execute("CREATE TABLE t (x TEXT)");
+
+        // Original table should still be intact.
+        let r = db.execute("SELECT val FROM t").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].values[0], Value::Text("one".into()));
+    }
+
+    #[test]
+    fn test_double_begin_fails() {
+        let mut db = Database::in_memory();
+        db.execute("BEGIN").unwrap();
+        assert!(db.execute("BEGIN").is_err());
+    }
+
+    #[test]
+    fn test_commit_without_begin_fails() {
+        let mut db = Database::in_memory();
+        assert!(db.execute("COMMIT").is_err());
+    }
+
+    #[test]
+    fn test_rollback_without_begin_fails() {
+        let mut db = Database::in_memory();
+        assert!(db.execute("ROLLBACK").is_err());
+    }
+
+    #[test]
+    fn test_transaction_with_multiple_tables() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, ref_id INTEGER)")
+            .unwrap();
+
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO a VALUES (1, 'hello')").unwrap();
+        db.execute("INSERT INTO b VALUES (1, 1)").unwrap();
+        db.execute("COMMIT").unwrap();
+
+        let r = db.execute("SELECT a.val FROM a INNER JOIN b ON a.id = b.ref_id").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].values[0], Value::Text("hello".into()));
+    }
+
+    #[test]
+    fn test_rollback_file_backed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("txn_test.db");
+
+        {
+            let mut db = Database::open(&db_path).unwrap();
+            db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+                .unwrap();
+            db.execute("INSERT INTO t VALUES (1, 'persisted')")
+                .unwrap();
+
+            db.execute("BEGIN").unwrap();
+            db.execute("INSERT INTO t VALUES (2, 'rolled_back')")
+                .unwrap();
+            db.execute("ROLLBACK").unwrap();
+
+            let r = db.execute("SELECT val FROM t").unwrap();
+            assert_eq!(r.rows.len(), 1);
+            assert_eq!(r.rows[0].values[0], Value::Text("persisted".into()));
+        }
+
+        // Reopen and verify.
+        {
+            let mut db = Database::open(&db_path).unwrap();
+            let r = db.execute("SELECT val FROM t").unwrap();
+            assert_eq!(r.rows.len(), 1);
+            assert_eq!(r.rows[0].values[0], Value::Text("persisted".into()));
+        }
     }
 }

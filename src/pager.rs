@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Result, RsqliteError};
 use crate::format::{self, DatabaseHeader, HEADER_SIZE};
+use crate::journal::Journal;
 
 /// A page number. Page 1 is the first page (contains the database header).
 /// Page 0 is invalid.
@@ -39,7 +40,6 @@ impl Page {
 /// The pager manages reading and writing pages from/to the database file.
 pub struct Pager {
     /// Path to the database file (None for in-memory databases).
-    #[allow(dead_code)]
     path: Option<PathBuf>,
     /// The open file handle (None for in-memory databases).
     file: Option<File>,
@@ -53,6 +53,8 @@ pub struct Pager {
     cache_limit: usize,
     /// LRU ordering: most recently accessed page numbers.
     lru: Vec<PageNumber>,
+    /// Rollback journal for transaction support.
+    pub journal: Journal,
 }
 
 impl Pager {
@@ -100,6 +102,21 @@ impl Pager {
 
         let page_size = header.page_size as usize;
 
+        // Check for hot journal recovery.
+        if file_exists {
+            let recovered = Journal::hot_journal_recovery(&path, page_size)?;
+            if !recovered.is_empty() {
+                for (page_num, data) in &recovered {
+                    let offset = (*page_num as u64 - 1) * page_size as u64;
+                    file.seek(SeekFrom::Start(offset))?;
+                    file.write_all(data)?;
+                }
+                file.sync_all()?;
+            }
+        }
+
+        let journal = Journal::new(Some(&path), page_size);
+
         Ok(Self {
             path: Some(path),
             file: Some(file),
@@ -108,6 +125,7 @@ impl Pager {
             cache: HashMap::new(),
             cache_limit: 100,
             lru: Vec::new(),
+            journal,
         })
     }
 
@@ -133,6 +151,8 @@ impl Pager {
         let mut cache = HashMap::new();
         cache.insert(1, page1);
 
+        let journal = Journal::in_memory(page_size);
+
         Self {
             path: None,
             file: None,
@@ -141,12 +161,18 @@ impl Pager {
             cache,
             cache_limit: 100,
             lru: vec![1],
+            journal,
         }
     }
 
     /// Get the page size.
     pub fn page_size(&self) -> usize {
         self.page_size
+    }
+
+    /// Get the database file path.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
     /// Read a page by its page number. Returns a reference to the cached page.
@@ -164,6 +190,8 @@ impl Pager {
     }
 
     /// Get a mutable reference to a page (marks it dirty).
+    /// If a journal transaction is active, saves the original page to the journal
+    /// before allowing modification.
     pub fn get_page_mut(&mut self, page_num: PageNumber) -> Result<&mut Page> {
         if page_num == 0 {
             return Err(RsqliteError::Corrupt("page number 0 is invalid".into()));
@@ -173,6 +201,16 @@ impl Pager {
             self.load_page(page_num)?;
         }
         self.touch_lru(page_num);
+
+        // Journal the page before modification (if transaction is active).
+        if self.journal.is_active() {
+            let page = self.cache.get(&page_num).unwrap();
+            if !page.dirty {
+                // Only journal pages that haven't been dirtied yet in this txn.
+                let data = page.data.clone();
+                self.journal.journal_page(page_num, &data)?;
+            }
+        }
 
         let page = self.cache.get_mut(&page_num).unwrap();
         page.dirty = true;
@@ -192,12 +230,71 @@ impl Pager {
         Ok(page_num)
     }
 
+    /// Rollback: restore pages from the journal and discard dirty cache entries.
+    pub fn rollback(&mut self) -> Result<()> {
+        let (pages, saved_page_count) = self.journal.rollback()?;
+
+        // Restore journaled pages.
+        for (page_num, data) in &pages {
+            // Restore into the cache.
+            if let Some(page) = self.cache.get_mut(page_num) {
+                page.data[..data.len()].copy_from_slice(data);
+                page.dirty = false;
+            }
+
+            // Also write back to disk.
+            if let Some(ref mut file) = self.file {
+                let offset = (*page_num as u64 - 1) * self.page_size as u64;
+                file.seek(SeekFrom::Start(offset))?;
+                file.write_all(data)?;
+            }
+        }
+
+        if !pages.is_empty() {
+            if let Some(ref mut file) = self.file {
+                file.sync_all()?;
+            }
+        }
+
+        // Re-read the header from page 1 cache (which may have been restored).
+        if let Some(page1) = self.cache.get(&1) {
+            let mut hdr_buf = [0u8; HEADER_SIZE];
+            hdr_buf.copy_from_slice(&page1.data[..HEADER_SIZE]);
+            if let Ok(h) = DatabaseHeader::parse(&hdr_buf) {
+                self.header = h;
+            }
+        }
+
+        // Restore page count if saved.
+        if let Some(pc) = saved_page_count {
+            self.header.page_count = pc;
+        }
+
+        // Discard any dirty pages that weren't in the journal (newly allocated).
+        let dirty_new: Vec<PageNumber> = self
+            .cache
+            .iter()
+            .filter(|(_, p)| p.dirty)
+            .map(|(&n, _)| n)
+            .collect();
+        for page_num in dirty_new {
+            self.cache.remove(&page_num);
+            self.lru.retain(|&p| p != page_num);
+        }
+
+        Ok(())
+    }
+
     /// Write all dirty pages to disk and update the header.
     pub fn flush(&mut self) -> Result<()> {
-        let file = match self.file.as_mut() {
-            Some(f) => f,
-            None => return Ok(()), // In-memory: nothing to flush.
-        };
+        if self.file.is_none() {
+            // In-memory: no file I/O, but still clear dirty flags.
+            for page in self.cache.values_mut() {
+                page.dirty = false;
+            }
+            return Ok(());
+        }
+        let file = self.file.as_mut().unwrap();
 
         // Write dirty pages.
         let dirty_pages: Vec<PageNumber> = self

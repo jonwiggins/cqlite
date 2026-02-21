@@ -665,3 +665,263 @@ fn test_complex_query() {
     assert_eq!(rows[1][0], Value::Text("B".into()));
     assert_eq!(rows[1][1], Value::Integer(2));
 }
+
+// ---- Cross-compatibility with sqlite3 ----
+
+/// Helper: check if sqlite3 is available.
+fn has_sqlite3() -> bool {
+    std::process::Command::new("sqlite3")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Helper: run sqlite3 command on a database file and return stdout.
+fn sqlite3_query(db_path: &std::path::Path, sql: &str) -> String {
+    let output = std::process::Command::new("sqlite3")
+        .arg(db_path.to_str().unwrap())
+        .arg(sql)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "sqlite3 failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// Helper: run multiple SQL statements via sqlite3 (piped to stdin).
+fn sqlite3_exec(db_path: &std::path::Path, sql: &str) {
+    use std::io::Write;
+    let mut child = std::process::Command::new("sqlite3")
+        .arg(db_path.to_str().unwrap())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(sql.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "sqlite3 exec failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_compat_write_cqlite_read_sqlite3_types() {
+    if !has_sqlite3() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("compat_types.db");
+
+    // Write various types with cqlite.
+    {
+        let mut db = Database::open(&db_path).unwrap();
+        exec(
+            &mut db,
+            "CREATE TABLE types_test (i INTEGER, r REAL, t TEXT, b BLOB, n);",
+        );
+        exec(
+            &mut db,
+            "INSERT INTO types_test VALUES (42, 3.14, 'hello world', X'DEADBEEF', NULL);",
+        );
+        exec(
+            &mut db,
+            "INSERT INTO types_test VALUES (-1, 0.0, '', X'', NULL);",
+        );
+        exec(
+            &mut db,
+            "INSERT INTO types_test VALUES (9999999999, 1.5e10, 'line1', X'00FF', NULL);",
+        );
+    }
+
+    // Read with sqlite3.
+    let out = sqlite3_query(
+        &db_path,
+        "SELECT typeof(i), typeof(r), typeof(t), typeof(b), typeof(n) FROM types_test LIMIT 1;",
+    );
+    assert_eq!(out.trim(), "integer|real|text|blob|null");
+
+    let out = sqlite3_query(&db_path, "SELECT COUNT(*) FROM types_test;");
+    assert_eq!(out.trim(), "3");
+
+    let out = sqlite3_query(&db_path, "SELECT i FROM types_test ORDER BY rowid;");
+    let lines: Vec<&str> = out.trim().lines().collect();
+    assert_eq!(lines, vec!["42", "-1", "9999999999"]);
+}
+
+#[test]
+fn test_compat_write_sqlite3_read_cqlite() {
+    if !has_sqlite3() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("compat_read.db");
+
+    // Create and populate with sqlite3.
+    sqlite3_exec(
+        &db_path,
+        "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);
+         INSERT INTO people VALUES (1, 'Alice', 30);
+         INSERT INTO people VALUES (2, 'Bob', 25);
+         INSERT INTO people VALUES (3, 'Charlie', 35);
+         CREATE INDEX idx_age ON people (age);",
+    );
+
+    // Read with cqlite.
+    let mut db = Database::open(&db_path).unwrap();
+    let rows = query(&mut db, "SELECT * FROM people ORDER BY id;");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][1], Value::Text("Alice".into()));
+    assert_eq!(rows[1][1], Value::Text("Bob".into()));
+    assert_eq!(rows[2][1], Value::Text("Charlie".into()));
+
+    // WHERE on indexed column.
+    let rows = query(
+        &mut db,
+        "SELECT name FROM people WHERE age > 28 ORDER BY name;",
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0], Value::Text("Alice".into()));
+    assert_eq!(rows[1][0], Value::Text("Charlie".into()));
+}
+
+#[test]
+fn test_compat_write_sqlite3_read_cqlite_multiple_tables() {
+    if !has_sqlite3() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("compat_multi.db");
+
+    sqlite3_exec(
+        &db_path,
+        "CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT);
+         INSERT INTO departments VALUES (1, 'Engineering');
+         INSERT INTO departments VALUES (2, 'Sales');
+         CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER);
+         INSERT INTO employees VALUES (1, 'Alice', 1);
+         INSERT INTO employees VALUES (2, 'Bob', 2);
+         INSERT INTO employees VALUES (3, 'Charlie', 1);",
+    );
+
+    let mut db = Database::open(&db_path).unwrap();
+    let rows = query(
+        &mut db,
+        "SELECT e.name, d.name FROM employees e INNER JOIN departments d ON e.dept_id = d.id ORDER BY e.id;",
+    );
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][0], Value::Text("Alice".into()));
+    assert_eq!(rows[0][1], Value::Text("Engineering".into()));
+    assert_eq!(rows[1][1], Value::Text("Sales".into()));
+}
+
+#[test]
+fn test_compat_roundtrip() {
+    if !has_sqlite3() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("compat_roundtrip.db");
+
+    // cqlite creates table and inserts data.
+    {
+        let mut db = Database::open(&db_path).unwrap();
+        exec(
+            &mut db,
+            "CREATE TABLE log (id INTEGER PRIMARY KEY, msg TEXT, level INTEGER);",
+        );
+        exec(&mut db, "INSERT INTO log VALUES (1, 'started', 0);");
+        exec(&mut db, "INSERT INTO log VALUES (2, 'error occurred', 2);");
+    }
+
+    // sqlite3 adds more data.
+    sqlite3_exec(
+        &db_path,
+        "INSERT INTO log VALUES (3, 'recovered', 1);
+         INSERT INTO log VALUES (4, 'shutdown', 0);",
+    );
+
+    // cqlite reads all data back.
+    {
+        let mut db = Database::open(&db_path).unwrap();
+        let rows = query(&mut db, "SELECT COUNT(*) FROM log;");
+        assert_eq!(rows[0][0], Value::Integer(4));
+
+        let rows = query(&mut db, "SELECT msg FROM log ORDER BY id;");
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0][0], Value::Text("started".into()));
+        assert_eq!(rows[3][0], Value::Text("shutdown".into()));
+    }
+}
+
+// ---- EXPLAIN / EXPLAIN QUERY PLAN ----
+
+#[test]
+fn test_explain() {
+    let mut db = Database::in_memory();
+    exec(&mut db, "CREATE TABLE t (a INTEGER, b TEXT);");
+
+    let result = db.execute("EXPLAIN SELECT * FROM t WHERE a > 1;").unwrap();
+    // Should have opcode-style columns.
+    assert_eq!(result.columns[0].name, "addr");
+    assert_eq!(result.columns[1].name, "opcode");
+    assert!(!result.rows.is_empty());
+    // First opcode should be Init.
+    assert_eq!(result.rows[0].values[1], Value::Text("Init".into()));
+    // Last opcode should be Halt.
+    let last = result.rows.last().unwrap();
+    assert_eq!(last.values[1], Value::Text("Halt".into()));
+}
+
+#[test]
+fn test_explain_query_plan_scan() {
+    let mut db = Database::in_memory();
+    exec(&mut db, "CREATE TABLE t (a INTEGER, b TEXT);");
+
+    let result = db.execute("EXPLAIN QUERY PLAN SELECT * FROM t;").unwrap();
+    assert_eq!(result.columns[3].name, "detail");
+    // Should show SCAN table t.
+    let detail = &result.rows[0].values[3];
+    assert_eq!(*detail, Value::Text("SCAN table t".into()));
+}
+
+#[test]
+fn test_explain_query_plan_with_index() {
+    let mut db = Database::in_memory();
+    exec(&mut db, "CREATE TABLE t (a INTEGER, b TEXT);");
+    exec(&mut db, "CREATE INDEX idx_a ON t (a);");
+
+    let result = db
+        .execute("EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1;")
+        .unwrap();
+    let detail = &result.rows[0].values[3];
+    assert_eq!(
+        *detail,
+        Value::Text("SEARCH table t USING INDEX idx_a".into())
+    );
+}
+
+#[test]
+fn test_explain_query_plan_order_by() {
+    let mut db = Database::in_memory();
+    exec(&mut db, "CREATE TABLE t (a INTEGER, b TEXT);");
+
+    let result = db
+        .execute("EXPLAIN QUERY PLAN SELECT * FROM t ORDER BY a;")
+        .unwrap();
+    let details: Vec<&Value> = result.rows.iter().map(|r| &r.values[3]).collect();
+    assert!(details
+        .iter()
+        .any(|d| *d == &Value::Text("USE TEMP B-TREE FOR ORDER BY".into())));
+}

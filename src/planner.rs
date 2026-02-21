@@ -68,22 +68,13 @@ impl Database {
             Statement::CreateIndex(ci) => self.execute_write(|db| db.execute_create_index(ci)),
             Statement::DropIndex(di) => self.execute_write(|db| db.execute_drop_index(di)),
             Statement::AlterTable(alter) => self.execute_write(|db| db.execute_alter_table(alter)),
-            Statement::Explain(inner) => {
-                let description = format!("{inner:?}");
-                Ok(QueryResult {
-                    columns: vec![ColumnInfo {
-                        name: "detail".to_string(),
-                        table: None,
-                    }],
-                    rows: vec![Row {
-                        values: vec![Value::Text(description)],
-                    }],
-                })
+            Statement::Explain(inner) => explain_statement(inner),
+            Statement::ExplainQueryPlan(inner) => {
+                let schema_entries = schema::read_schema(&mut self.pager)?;
+                let table_schemas = build_table_schemas(&schema_entries)?;
+                explain_query_plan(inner, &table_schemas)
             }
             Statement::Pragma(pragma) => execute_pragma(pragma, &mut self.pager),
-            _ => Err(RsqliteError::NotImplemented(format!(
-                "statement type: {stmt:?}"
-            ))),
         }
     }
 
@@ -1014,12 +1005,31 @@ fn build_table_schemas(entries: &[SchemaEntry]) -> Result<Vec<TableSchema>> {
             }
         };
 
+        // Collect index info for this table from schema entries.
+        let mut indexes = Vec::new();
+        for idx_entry in entries {
+            if idx_entry.entry_type != "index"
+                || !idx_entry.tbl_name.eq_ignore_ascii_case(&entry.name)
+            {
+                continue;
+            }
+            if let Some(ref sql) = idx_entry.sql {
+                if let Ok(Statement::CreateIndex(ci)) = crate::parser::parse(sql) {
+                    indexes.push(vm::TableIndexInfo {
+                        name: idx_entry.name.clone(),
+                        columns: ci.columns.iter().map(|c| c.name.clone()).collect(),
+                    });
+                }
+            }
+        }
+
         schemas.push(TableSchema {
             name: entry.name.clone(),
             columns: info.columns,
             root_page: entry.rootpage as u32,
             rowid_column: info.rowid_column,
             column_constraints: info.constraints,
+            indexes,
         });
     }
 
@@ -1841,6 +1851,343 @@ fn execute_pragma(pragma: &crate::ast::PragmaStatement, pager: &mut Pager) -> Re
                 rows: vec![],
             })
         }
+    }
+}
+
+/// Produce EXPLAIN output: one row per opcode-style description of what the VM will do.
+fn explain_statement(stmt: &Statement) -> Result<QueryResult> {
+    let columns = vec![
+        ColumnInfo {
+            name: "addr".into(),
+            table: None,
+        },
+        ColumnInfo {
+            name: "opcode".into(),
+            table: None,
+        },
+        ColumnInfo {
+            name: "p1".into(),
+            table: None,
+        },
+        ColumnInfo {
+            name: "p2".into(),
+            table: None,
+        },
+        ColumnInfo {
+            name: "p3".into(),
+            table: None,
+        },
+        ColumnInfo {
+            name: "p4".into(),
+            table: None,
+        },
+        ColumnInfo {
+            name: "p5".into(),
+            table: None,
+        },
+        ColumnInfo {
+            name: "comment".into(),
+            table: None,
+        },
+    ];
+
+    let mut rows = Vec::new();
+    let mut addr = 0i64;
+
+    let mut emit = |opcode: &str, p1: i64, p2: i64, p3: i64, p4: &str, comment: &str| {
+        rows.push(Row {
+            values: vec![
+                Value::Integer(addr),
+                Value::Text(opcode.into()),
+                Value::Integer(p1),
+                Value::Integer(p2),
+                Value::Integer(p3),
+                Value::Text(p4.into()),
+                Value::Integer(0),
+                Value::Text(comment.into()),
+            ],
+        });
+        addr += 1;
+    };
+
+    match stmt {
+        Statement::Select(select) => {
+            emit("Init", 0, 0, 0, "", "Start at 0");
+            if let Some(ref from) = select.from {
+                if let crate::ast::TableRef::Table { ref name, .. } = from.table {
+                    emit("OpenRead", 0, 0, 0, name, &format!("table {name}"));
+                    emit("Rewind", 0, 0, 0, "", "");
+                }
+            }
+            if select.where_clause.is_some() {
+                emit("Filter", 0, 0, 0, "", "WHERE clause");
+            }
+            emit("ResultRow", 0, 0, 0, "", "output row");
+            if select.from.is_some() {
+                emit("Next", 0, 0, 0, "", "advance cursor");
+            }
+            emit("Halt", 0, 0, 0, "", "");
+        }
+        Statement::Insert(insert) => {
+            emit("Init", 0, 0, 0, "", "Start at 0");
+            emit(
+                "OpenWrite",
+                0,
+                0,
+                0,
+                &insert.table,
+                &format!("table {}", insert.table),
+            );
+            if let InsertSource::Values(ref val_rows) = insert.source {
+                for _ in val_rows {
+                    emit("MakeRecord", 0, 0, 0, "", "");
+                    emit("Insert", 0, 0, 0, "", "");
+                }
+            }
+            emit("Halt", 0, 0, 0, "", "");
+        }
+        Statement::Update(update) => {
+            emit("Init", 0, 0, 0, "", "Start at 0");
+            emit(
+                "OpenWrite",
+                0,
+                0,
+                0,
+                &update.table,
+                &format!("table {}", update.table),
+            );
+            emit("Rewind", 0, 0, 0, "", "");
+            if update.where_clause.is_some() {
+                emit("Filter", 0, 0, 0, "", "WHERE clause");
+            }
+            emit("MakeRecord", 0, 0, 0, "", "build updated row");
+            emit("Insert", 0, 0, 0, "", "replace row");
+            emit("Next", 0, 0, 0, "", "advance cursor");
+            emit("Halt", 0, 0, 0, "", "");
+        }
+        Statement::Delete(delete) => {
+            emit("Init", 0, 0, 0, "", "Start at 0");
+            emit(
+                "OpenWrite",
+                0,
+                0,
+                0,
+                &delete.table,
+                &format!("table {}", delete.table),
+            );
+            emit("Rewind", 0, 0, 0, "", "");
+            if delete.where_clause.is_some() {
+                emit("Filter", 0, 0, 0, "", "WHERE clause");
+            }
+            emit("Delete", 0, 0, 0, "", "delete row");
+            emit("Next", 0, 0, 0, "", "advance cursor");
+            emit("Halt", 0, 0, 0, "", "");
+        }
+        _ => {
+            emit("Init", 0, 0, 0, "", "");
+            emit("Halt", 0, 0, 0, "", "");
+        }
+    }
+
+    Ok(QueryResult { columns, rows })
+}
+
+/// Produce EXPLAIN QUERY PLAN output with id/parent/notused/detail columns.
+fn explain_query_plan(stmt: &Statement, tables: &[TableSchema]) -> Result<QueryResult> {
+    let columns = vec![
+        ColumnInfo {
+            name: "id".into(),
+            table: None,
+        },
+        ColumnInfo {
+            name: "parent".into(),
+            table: None,
+        },
+        ColumnInfo {
+            name: "notused".into(),
+            table: None,
+        },
+        ColumnInfo {
+            name: "detail".into(),
+            table: None,
+        },
+    ];
+
+    let mut rows = Vec::new();
+    let mut next_id = 2i64; // SQLite starts sub-plan IDs at 2
+
+    match stmt {
+        Statement::Select(select) => {
+            eqp_select(select, tables, 0, &mut next_id, &mut rows);
+        }
+        Statement::Insert(insert) => {
+            rows.push(eqp_row(1, 0, 0, &format!("SCAN table {}", insert.table)));
+        }
+        Statement::Update(update) => {
+            rows.push(eqp_row(1, 0, 0, &format!("SCAN table {}", update.table)));
+        }
+        Statement::Delete(delete) => {
+            rows.push(eqp_row(1, 0, 0, &format!("SCAN table {}", delete.table)));
+        }
+        _ => {}
+    }
+
+    Ok(QueryResult { columns, rows })
+}
+
+fn eqp_select(
+    select: &crate::ast::SelectStatement,
+    tables: &[TableSchema],
+    parent: i64,
+    next_id: &mut i64,
+    rows: &mut Vec<Row>,
+) {
+    if let Some(ref from) = select.from {
+        // Main table scan.
+        let table_name = match &from.table {
+            crate::ast::TableRef::Table { name, .. } => name.as_str(),
+            crate::ast::TableRef::Subquery { alias, .. } => alias.as_str(),
+        };
+
+        let detail = if let crate::ast::TableRef::Subquery { select: sub, .. } = &from.table {
+            let id = *next_id;
+            *next_id += 1;
+            rows.push(eqp_row(
+                id,
+                parent,
+                0,
+                &format!("SCAN subquery {table_name}"),
+            ));
+            eqp_select(sub, tables, id, next_id, rows);
+            return; // already handled
+        } else {
+            // Check if any index could be used for the WHERE clause.
+            let index_detail = select
+                .where_clause
+                .as_ref()
+                .and_then(|where_expr| find_usable_index(table_name, where_expr, tables));
+            match index_detail {
+                Some(idx_name) => format!("SEARCH table {table_name} USING INDEX {idx_name}"),
+                None => format!("SCAN table {table_name}"),
+            }
+        };
+
+        let id = *next_id;
+        *next_id += 1;
+        rows.push(eqp_row(id, parent, 0, &detail));
+
+        // JOINs.
+        for join in &from.joins {
+            let right_name = match &join.table {
+                crate::ast::TableRef::Table { name, .. } => name.as_str(),
+                crate::ast::TableRef::Subquery { alias, .. } => alias.as_str(),
+            };
+            let join_detail = format!("SCAN table {right_name}");
+            let jid = *next_id;
+            *next_id += 1;
+            rows.push(eqp_row(jid, parent, 0, &join_detail));
+        }
+    }
+
+    // Compound selects.
+    for compound in &select.compound {
+        let op_name = match compound.op {
+            crate::ast::CompoundOp::Union => "UNION",
+            crate::ast::CompoundOp::UnionAll => "UNION ALL",
+            crate::ast::CompoundOp::Intersect => "INTERSECT",
+            crate::ast::CompoundOp::Except => "EXCEPT",
+        };
+        let cid = *next_id;
+        *next_id += 1;
+        rows.push(eqp_row(
+            cid,
+            parent,
+            0,
+            &format!("COMPOUND SUBQUERY ({op_name})"),
+        ));
+        eqp_select(&compound.select, tables, cid, next_id, rows);
+    }
+
+    // ORDER BY / GROUP BY use temporary B-trees.
+    if select.order_by.is_some() {
+        rows.push(eqp_row(0, 0, 0, "USE TEMP B-TREE FOR ORDER BY"));
+    }
+    if select.group_by.is_some() {
+        rows.push(eqp_row(0, 0, 0, "USE TEMP B-TREE FOR GROUP BY"));
+    }
+    if select.distinct {
+        rows.push(eqp_row(0, 0, 0, "USE TEMP B-TREE FOR DISTINCT"));
+    }
+}
+
+/// Check if there's an index on `table_name` whose first column matches a simple
+/// equality or comparison in the WHERE expression.
+fn find_usable_index(
+    table_name: &str,
+    where_expr: &Expr,
+    tables: &[TableSchema],
+) -> Option<String> {
+    // Collect column names referenced in simple comparisons.
+    let mut where_columns = Vec::new();
+    collect_where_columns(where_expr, &mut where_columns);
+
+    // Look for an index whose first column matches.
+    for ts in tables {
+        if !ts.name.eq_ignore_ascii_case(table_name) {
+            continue;
+        }
+        for idx in &ts.indexes {
+            if let Some(first_col) = idx.columns.first() {
+                if where_columns
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(first_col))
+                {
+                    return Some(idx.name.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Recursively collect column names from simple comparison expressions.
+fn collect_where_columns(expr: &Expr, cols: &mut Vec<String>) {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            use crate::ast::BinaryOp;
+            match op {
+                BinaryOp::Eq | BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge => {
+                    if let Expr::ColumnRef { column, .. } = left.as_ref() {
+                        cols.push(column.clone());
+                    }
+                    if let Expr::ColumnRef { column, .. } = right.as_ref() {
+                        cols.push(column.clone());
+                    }
+                }
+                BinaryOp::And => {
+                    collect_where_columns(left, cols);
+                    collect_where_columns(right, cols);
+                }
+                _ => {}
+            }
+        }
+        Expr::IsNull { operand, .. } => {
+            if let Expr::ColumnRef { column, .. } = operand.as_ref() {
+                cols.push(column.clone());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn eqp_row(id: i64, parent: i64, notused: i64, detail: &str) -> Row {
+    Row {
+        values: vec![
+            Value::Integer(id),
+            Value::Integer(parent),
+            Value::Integer(notused),
+            Value::Text(detail.into()),
+        ],
     }
 }
 

@@ -59,7 +59,7 @@ fn main() {
         // Print prompt.
         if is_tty {
             let prompt = if input_buf.is_empty() {
-                "rsqlite> "
+                "cqlite> "
             } else {
                 "   ...> "
             };
@@ -194,10 +194,76 @@ fn handle_dot_command(input: &str, db: &mut Database, state: &mut ReplState) {
                 }
             }
         }
+        ".dump" => match db.schema() {
+            Ok(entries) => {
+                println!("BEGIN TRANSACTION;");
+                for entry in &entries {
+                    if !arg.is_empty() && !entry.name.eq_ignore_ascii_case(arg) {
+                        continue;
+                    }
+                    if let Some(ref sql) = entry.sql {
+                        println!("{sql};");
+                    }
+                    // Dump table data.
+                    if entry.entry_type == "table" {
+                        if let Ok(result) = db.execute(&format!("SELECT * FROM \"{}\"", entry.name))
+                        {
+                            for row in &result.rows {
+                                let vals: Vec<String> = row
+                                    .values
+                                    .iter()
+                                    .map(|v| match v {
+                                        Value::Null => "NULL".to_string(),
+                                        Value::Integer(i) => i.to_string(),
+                                        Value::Real(f) => format!("{f}"),
+                                        Value::Text(s) => {
+                                            format!("'{}'", s.replace('\'', "''"))
+                                        }
+                                        Value::Blob(b) => {
+                                            let hex: String = b
+                                                .iter()
+                                                .map(|byte| format!("{byte:02X}"))
+                                                .collect();
+                                            format!("X'{hex}'")
+                                        }
+                                    })
+                                    .collect();
+                                println!(
+                                    "INSERT INTO \"{}\" VALUES({});",
+                                    entry.name,
+                                    vals.join(",")
+                                );
+                            }
+                        }
+                    }
+                }
+                println!("COMMIT;");
+            }
+            Err(e) => eprintln!("Error: {e}"),
+        },
+        ".indexes" | ".indices" => match db.schema() {
+            Ok(entries) => {
+                for entry in &entries {
+                    if entry.entry_type != "index" {
+                        continue;
+                    }
+                    if entry.sql.is_none() {
+                        continue; // skip autoindexes
+                    }
+                    if !arg.is_empty() && !entry.tbl_name.eq_ignore_ascii_case(arg) {
+                        continue;
+                    }
+                    println!("{}", entry.name);
+                }
+            }
+            Err(e) => eprintln!("Error: {e}"),
+        },
         ".help" => {
+            println!(".dump ?TABLE?          Dump the database (or table) as SQL");
             println!(".exit                  Exit this program");
             println!(".headers on|off        Turn display of headers on or off");
             println!(".help                  Show this help");
+            println!(".indexes ?TABLE?       List indexes (optionally for TABLE)");
             println!(".mode column|csv|line  Set output mode");
             println!(".open FILENAME         Close existing database and reopen FILENAME");
             println!(".quit                  Exit this program");

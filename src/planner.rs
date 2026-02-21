@@ -1950,4 +1950,108 @@ mod tests {
         let r = db.execute("SELECT CAST('3.14' AS REAL)").unwrap();
         assert_eq!(r.rows[0].values[0], Value::Real(3.14));
     }
+
+    // -- Subquery tests --
+
+    #[test]
+    fn test_in_subquery() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY, t1_id INTEGER)")
+            .unwrap();
+        db.execute("INSERT INTO t1 VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO t1 VALUES (2, 'Bob')").unwrap();
+        db.execute("INSERT INTO t1 VALUES (3, 'Charlie')").unwrap();
+        db.execute("INSERT INTO t2 VALUES (1, 1)").unwrap();
+        db.execute("INSERT INTO t2 VALUES (2, 3)").unwrap();
+
+        // Select names where id is in the subquery.
+        let r = db
+            .execute("SELECT name FROM t1 WHERE id IN (SELECT t1_id FROM t2)")
+            .unwrap();
+        assert_eq!(r.rows.len(), 2);
+        let names: Vec<&Value> = r.rows.iter().map(|r| &r.values[0]).collect();
+        assert!(names.contains(&&Value::Text("Alice".into())));
+        assert!(names.contains(&&Value::Text("Charlie".into())));
+    }
+
+    #[test]
+    fn test_not_in_subquery() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY, t1_id INTEGER)")
+            .unwrap();
+        db.execute("INSERT INTO t1 VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO t1 VALUES (2, 'Bob')").unwrap();
+        db.execute("INSERT INTO t1 VALUES (3, 'Charlie')").unwrap();
+        db.execute("INSERT INTO t2 VALUES (1, 1)").unwrap();
+        db.execute("INSERT INTO t2 VALUES (2, 3)").unwrap();
+
+        let r = db
+            .execute("SELECT name FROM t1 WHERE id NOT IN (SELECT t1_id FROM t2)")
+            .unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].values[0], Value::Text("Bob".into()));
+    }
+
+    #[test]
+    fn test_exists_subquery() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer TEXT, amount REAL)")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 'Alice', 100.0)")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (2, 'Bob', 50.0)")
+            .unwrap();
+
+        // EXISTS returns true when subquery has rows.
+        let r = db
+            .execute("SELECT 1 WHERE EXISTS (SELECT * FROM orders WHERE amount > 75.0)")
+            .unwrap();
+        assert_eq!(r.rows.len(), 1);
+
+        // NOT EXISTS.
+        let r = db
+            .execute("SELECT 1 WHERE NOT EXISTS (SELECT * FROM orders WHERE amount > 200.0)")
+            .unwrap();
+        assert_eq!(r.rows.len(), 1);
+    }
+
+    #[test]
+    fn test_scalar_subquery() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (val INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (10)").unwrap();
+        db.execute("INSERT INTO t VALUES (20)").unwrap();
+        db.execute("INSERT INTO t VALUES (30)").unwrap();
+
+        let r = db
+            .execute("SELECT (SELECT MAX(val) FROM t)")
+            .unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Integer(30));
+    }
+
+    // -- PRAGMA tests --
+
+    #[test]
+    fn test_pragma_table_info() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)")
+            .unwrap();
+
+        let r = db.execute("PRAGMA table_info(t)").unwrap();
+        assert_eq!(r.rows.len(), 3);
+        assert_eq!(r.rows[0].values[1], Value::Text("id".into()));
+        assert_eq!(r.rows[1].values[1], Value::Text("name".into()));
+        assert_eq!(r.rows[2].values[1], Value::Text("age".into()));
+    }
+
+    #[test]
+    fn test_pragma_page_size() {
+        let mut db = Database::in_memory();
+        let r = db.execute("PRAGMA page_size").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Integer(4096));
+    }
 }

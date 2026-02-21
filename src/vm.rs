@@ -276,10 +276,55 @@ pub fn execute_select(
 
     let column_names: Vec<&str> = column_names_owned.iter().map(|c| c.as_str()).collect();
 
+    // Pre-resolve subqueries in the WHERE clause and SELECT columns.
+    let resolved_where = if let Some(ref where_expr) = stmt.where_clause {
+        Some(resolve_subqueries(where_expr, pager, tables)?)
+    } else {
+        None
+    };
+
+    let resolved_columns: Vec<ResultColumn> = stmt
+        .columns
+        .iter()
+        .map(|rc| match rc {
+            ResultColumn::Expr { expr, alias } => {
+                let resolved = resolve_subqueries(expr, pager, tables)?;
+                Ok(ResultColumn::Expr {
+                    expr: resolved,
+                    alias: alias.clone(),
+                })
+            }
+            other => Ok(other.clone()),
+        })
+        .collect::<Result<_>>()?;
+
+    let resolved_order_by: Option<Vec<crate::ast::OrderByItem>> =
+        if let Some(ref order_by) = stmt.order_by {
+            Some(
+                order_by
+                    .iter()
+                    .map(|item| {
+                        Ok(crate::ast::OrderByItem {
+                            expr: resolve_subqueries(&item.expr, pager, tables)?,
+                            direction: item.direction.clone(),
+                        })
+                    })
+                    .collect::<Result<_>>()?,
+            )
+        } else {
+            None
+        };
+
+    let resolved_having = if let Some(ref having_expr) = stmt.having {
+        Some(resolve_subqueries(having_expr, pager, tables)?)
+    } else {
+        None
+    };
+
     // Apply WHERE filter.
     let mut filtered_rows: Vec<(i64, Vec<Value>)> = Vec::new();
     for (rowid, values) in &raw_rows {
-        if let Some(ref where_expr) = stmt.where_clause {
+        if let Some(ref where_expr) = resolved_where {
             let result = eval_expr(where_expr, &column_names, values, *rowid, table_name)?;
             if result.is_truthy() {
                 filtered_rows.push((*rowid, values.clone()));
@@ -291,12 +336,12 @@ pub fn execute_select(
 
     // Handle GROUP BY and aggregates.
     let (result_columns, result_rows, filtered_rows) = if stmt.group_by.is_some()
-        || has_aggregate(&stmt.columns)
+        || has_aggregate(&resolved_columns)
     {
         let (cols, rows) = execute_group_by(
-            &stmt.columns,
+            &resolved_columns,
             &stmt.group_by,
-            &stmt.having,
+            &resolved_having,
             &column_names,
             &filtered_rows,
             table_name,
@@ -311,21 +356,21 @@ pub fn execute_select(
         (cols, rows, synth_rows)
     } else {
         let (cols, rows) =
-            project_columns(&stmt.columns, &column_names, &filtered_rows, table_name)?;
+            project_columns(&resolved_columns, &column_names, &filtered_rows, table_name)?;
         (cols, rows, filtered_rows)
     };
 
     // Apply ORDER BY.
     let mut result_rows = result_rows;
-    if let Some(ref order_by) = stmt.order_by {
+    if let Some(ref order_by) = resolved_order_by {
         // For ORDER BY after GROUP BY, evaluate expressions against result columns.
         // For regular queries, evaluate against source columns.
-        let order_col_names: Vec<&str> = if stmt.group_by.is_some() || has_aggregate(&stmt.columns)
-        {
-            result_columns.iter().map(|c| c.name.as_str()).collect()
-        } else {
-            column_names.clone()
-        };
+        let order_col_names: Vec<&str> =
+            if stmt.group_by.is_some() || has_aggregate(&resolved_columns) {
+                result_columns.iter().map(|c| c.name.as_str()).collect()
+            } else {
+                column_names.clone()
+            };
 
         let mut indexed: Vec<(usize, Vec<Value>)> = Vec::new();
         for (i, (rowid, values)) in filtered_rows.iter().enumerate() {
@@ -1891,6 +1936,130 @@ fn eval_function(
         _ => Err(RsqliteError::Runtime(format!(
             "no such function: {name}"
         ))),
+    }
+}
+
+/// Resolve subqueries in an expression tree by executing them and
+/// replacing them with their results (literal values).
+fn resolve_subqueries(
+    expr: &Expr,
+    pager: &mut Pager,
+    tables: &[TableSchema],
+) -> Result<Expr> {
+    match expr {
+        // IN (SELECT ...) → IN (value1, value2, ...)
+        Expr::In {
+            operand,
+            list: crate::ast::InList::Subquery(sub_select),
+            negated,
+        } => {
+            let result = execute_select(pager, sub_select, tables)?;
+            // Collect first column values from the subquery result.
+            let value_exprs: Vec<Expr> = result
+                .rows
+                .iter()
+                .map(|row| {
+                    let val = row.values.first().cloned().unwrap_or(Value::Null);
+                    value_to_literal_expr(&val)
+                })
+                .collect();
+            Ok(Expr::In {
+                operand: Box::new(resolve_subqueries(operand, pager, tables)?),
+                list: crate::ast::InList::Values(value_exprs),
+                negated: *negated,
+            })
+        }
+        // EXISTS (SELECT ...) → 1 or 0
+        Expr::Exists {
+            subquery,
+            negated,
+        } => {
+            let result = execute_select(pager, subquery, tables)?;
+            let exists = !result.rows.is_empty();
+            let truth = if *negated { !exists } else { exists };
+            Ok(Expr::Literal(LiteralValue::Integer(if truth { 1 } else { 0 })))
+        }
+        // Scalar subquery: (SELECT x) → literal value
+        Expr::Subquery(sub_select) => {
+            let result = execute_select(pager, sub_select, tables)?;
+            let val = result
+                .rows
+                .first()
+                .and_then(|r| r.values.first())
+                .cloned()
+                .unwrap_or(Value::Null);
+            Ok(value_to_literal_expr(&val))
+        }
+        // Recursively resolve subqueries in compound expressions.
+        Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
+            left: Box::new(resolve_subqueries(left, pager, tables)?),
+            op: *op,
+            right: Box::new(resolve_subqueries(right, pager, tables)?),
+        }),
+        Expr::UnaryOp { op, operand } => Ok(Expr::UnaryOp {
+            op: *op,
+            operand: Box::new(resolve_subqueries(operand, pager, tables)?),
+        }),
+        Expr::Parenthesized(inner) => Ok(Expr::Parenthesized(Box::new(
+            resolve_subqueries(inner, pager, tables)?,
+        ))),
+        Expr::IsNull { operand, negated } => Ok(Expr::IsNull {
+            operand: Box::new(resolve_subqueries(operand, pager, tables)?),
+            negated: *negated,
+        }),
+        Expr::Between {
+            operand,
+            low,
+            high,
+            negated,
+        } => Ok(Expr::Between {
+            operand: Box::new(resolve_subqueries(operand, pager, tables)?),
+            low: Box::new(resolve_subqueries(low, pager, tables)?),
+            high: Box::new(resolve_subqueries(high, pager, tables)?),
+            negated: *negated,
+        }),
+        Expr::In {
+            operand,
+            list: crate::ast::InList::Values(exprs),
+            negated,
+        } => {
+            let resolved_exprs: Vec<Expr> = exprs
+                .iter()
+                .map(|e| resolve_subqueries(e, pager, tables))
+                .collect::<Result<_>>()?;
+            Ok(Expr::In {
+                operand: Box::new(resolve_subqueries(operand, pager, tables)?),
+                list: crate::ast::InList::Values(resolved_exprs),
+                negated: *negated,
+            })
+        }
+        Expr::Like {
+            operand,
+            pattern,
+            negated,
+            escape,
+        } => Ok(Expr::Like {
+            operand: Box::new(resolve_subqueries(operand, pager, tables)?),
+            pattern: Box::new(resolve_subqueries(pattern, pager, tables)?),
+            negated: *negated,
+            escape: match escape {
+                Some(e) => Some(Box::new(resolve_subqueries(e, pager, tables)?)),
+                None => None,
+            },
+        }),
+        // Leaf expressions: no subqueries to resolve.
+        _ => Ok(expr.clone()),
+    }
+}
+
+/// Convert a Value to a literal Expr.
+fn value_to_literal_expr(val: &Value) -> Expr {
+    match val {
+        Value::Null => Expr::Literal(LiteralValue::Null),
+        Value::Integer(n) => Expr::Literal(LiteralValue::Integer(*n)),
+        Value::Real(f) => Expr::Literal(LiteralValue::Real(*f)),
+        Value::Text(s) => Expr::Literal(LiteralValue::String(s.clone())),
+        Value::Blob(b) => Expr::Literal(LiteralValue::Blob(b.clone())),
     }
 }
 

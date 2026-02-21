@@ -925,3 +925,153 @@ fn test_explain_query_plan_order_by() {
         .iter()
         .any(|d| *d == &Value::Text("USE TEMP B-TREE FOR ORDER BY".into())));
 }
+
+// ---- ORDER BY numeric column references ----
+
+#[test]
+fn test_order_by_column_number() {
+    let mut db = Database::in_memory();
+    exec(&mut db, "CREATE TABLE t (a INTEGER, b TEXT);");
+    exec(&mut db, "INSERT INTO t VALUES (3, 'c');");
+    exec(&mut db, "INSERT INTO t VALUES (1, 'a');");
+    exec(&mut db, "INSERT INTO t VALUES (2, 'b');");
+
+    // ORDER BY 1 should sort by first column (a).
+    let rows = query(&mut db, "SELECT a, b FROM t ORDER BY 1;");
+    assert_eq!(rows[0][0], Value::Integer(1));
+    assert_eq!(rows[1][0], Value::Integer(2));
+    assert_eq!(rows[2][0], Value::Integer(3));
+}
+
+#[test]
+fn test_order_by_column_number_desc() {
+    let mut db = Database::in_memory();
+    exec(&mut db, "CREATE TABLE t (a INTEGER, b TEXT);");
+    exec(&mut db, "INSERT INTO t VALUES (1, 'a');");
+    exec(&mut db, "INSERT INTO t VALUES (3, 'c');");
+    exec(&mut db, "INSERT INTO t VALUES (2, 'b');");
+
+    let rows = query(&mut db, "SELECT a, b FROM t ORDER BY 1 DESC;");
+    assert_eq!(rows[0][0], Value::Integer(3));
+    assert_eq!(rows[1][0], Value::Integer(2));
+    assert_eq!(rows[2][0], Value::Integer(1));
+}
+
+#[test]
+fn test_order_by_multiple_column_numbers() {
+    let mut db = Database::in_memory();
+    exec(&mut db, "CREATE TABLE t (a INTEGER, b INTEGER);");
+    exec(&mut db, "INSERT INTO t VALUES (1, 20);");
+    exec(&mut db, "INSERT INTO t VALUES (1, 10);");
+    exec(&mut db, "INSERT INTO t VALUES (2, 5);");
+
+    let rows = query(&mut db, "SELECT a, b FROM t ORDER BY 1, 2;");
+    assert_eq!(rows[0], vec![Value::Integer(1), Value::Integer(10)]);
+    assert_eq!(rows[1], vec![Value::Integer(1), Value::Integer(20)]);
+    assert_eq!(rows[2], vec![Value::Integer(2), Value::Integer(5)]);
+}
+
+#[test]
+fn test_order_by_column_alias() {
+    let mut db = Database::in_memory();
+    exec(&mut db, "CREATE TABLE t (a INTEGER, b INTEGER);");
+    exec(&mut db, "INSERT INTO t VALUES (3, 10);");
+    exec(&mut db, "INSERT INTO t VALUES (1, 20);");
+    exec(&mut db, "INSERT INTO t VALUES (2, 30);");
+
+    let rows = query(&mut db, "SELECT a+b AS total FROM t ORDER BY total;");
+    assert_eq!(rows[0][0], Value::Integer(13));
+    assert_eq!(rows[1][0], Value::Integer(21));
+    assert_eq!(rows[2][0], Value::Integer(32));
+}
+
+// ---- Table alias resolution ----
+
+#[test]
+fn test_table_alias_in_where() {
+    let mut db = Database::in_memory();
+    exec(&mut db, "CREATE TABLE t1 (a INTEGER, b TEXT);");
+    exec(&mut db, "INSERT INTO t1 VALUES (1, 'one');");
+    exec(&mut db, "INSERT INTO t1 VALUES (2, 'two');");
+    exec(&mut db, "INSERT INTO t1 VALUES (3, 'three');");
+
+    let rows = query(&mut db, "SELECT x.a, x.b FROM t1 AS x WHERE x.a > 1;");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0], Value::Integer(2));
+    assert_eq!(rows[1][0], Value::Integer(3));
+}
+
+#[test]
+fn test_table_alias_select_star() {
+    let mut db = Database::in_memory();
+    exec(&mut db, "CREATE TABLE t1 (a INTEGER, b TEXT);");
+    exec(&mut db, "INSERT INTO t1 VALUES (1, 'hello');");
+
+    let rows = query(&mut db, "SELECT * FROM t1 AS x WHERE x.a = 1;");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Integer(1));
+}
+
+// ---- Correlated subqueries ----
+
+#[test]
+fn test_correlated_subquery_scalar() {
+    let mut db = Database::in_memory();
+    exec(&mut db, "CREATE TABLE t1 (a INTEGER, b INTEGER);");
+    exec(&mut db, "INSERT INTO t1 VALUES (1, 10);");
+    exec(&mut db, "INSERT INTO t1 VALUES (2, 20);");
+    exec(&mut db, "INSERT INTO t1 VALUES (3, 30);");
+
+    // Count how many rows have b less than current row's b.
+    let rows = query(
+        &mut db,
+        "SELECT a, (SELECT count(*) FROM t1 AS x WHERE x.b < t1.b) FROM t1 ORDER BY 1;",
+    );
+    assert_eq!(rows[0], vec![Value::Integer(1), Value::Integer(0)]);
+    assert_eq!(rows[1], vec![Value::Integer(2), Value::Integer(1)]);
+    assert_eq!(rows[2], vec![Value::Integer(3), Value::Integer(2)]);
+}
+
+#[test]
+fn test_correlated_exists_subquery() {
+    let mut db = Database::in_memory();
+    exec(&mut db, "CREATE TABLE t1 (a INTEGER, b INTEGER);");
+    exec(&mut db, "INSERT INTO t1 VALUES (1, 10);");
+    exec(&mut db, "INSERT INTO t1 VALUES (2, 20);");
+    exec(&mut db, "INSERT INTO t1 VALUES (3, 30);");
+
+    let rows = query(
+        &mut db,
+        "SELECT a FROM t1 WHERE EXISTS(SELECT 1 FROM t1 AS x WHERE x.b < t1.b) ORDER BY 1;",
+    );
+    // Rows where at least one other row has smaller b: a=2 (b=20 > 10) and a=3 (b=30 > 10,20)
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0], Value::Integer(2));
+    assert_eq!(rows[1][0], Value::Integer(3));
+}
+
+// ---- CASE/WHEN with subqueries ----
+
+#[test]
+fn test_case_when_with_subquery() {
+    let mut db = Database::in_memory();
+    exec(&mut db, "CREATE TABLE t (a INTEGER);");
+    exec(&mut db, "INSERT INTO t VALUES (1);");
+    exec(&mut db, "INSERT INTO t VALUES (5);");
+    exec(&mut db, "INSERT INTO t VALUES (10);");
+
+    let rows = query(
+        &mut db,
+        "SELECT CASE WHEN a > (SELECT avg(a) FROM t) THEN 'high' ELSE 'low' END FROM t ORDER BY 1;",
+    );
+    // avg(a) = (1+5+10)/3 ≈ 5.33; so a=1 → low, a=5 → low, a=10 → high
+    assert_eq!(rows.len(), 3);
+    let vals: Vec<&Value> = rows.iter().map(|r| &r[0]).collect();
+    assert!(vals.contains(&&Value::Text("high".into())));
+    assert_eq!(
+        vals.iter()
+            .filter(|v| ***v == Value::Text("low".into()))
+            .count(),
+        2
+    );
+}

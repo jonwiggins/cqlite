@@ -101,7 +101,7 @@ pub fn execute_select(
     tables: &[TableSchema],
 ) -> Result<QueryResult> {
     // Determine the source table(s).
-    let (table_schema, _table_alias) = match &stmt.from {
+    let (table_schema, table_alias, original_table_name) = match &stmt.from {
         Some(from) => {
             let (table_name, alias) = match &from.table {
                 crate::ast::TableRef::Table { name, alias } => {
@@ -115,9 +115,13 @@ pub fn execute_select(
                 .iter()
                 .find(|t| t.name.eq_ignore_ascii_case(table_name))
                 .ok_or_else(|| RsqliteError::Runtime(format!("no such table: {table_name}")))?;
-            (Some(schema), alias.to_string())
+            (
+                Some(schema),
+                alias.to_string(),
+                Some(table_name.to_string()),
+            )
         }
-        None => (None, String::new()),
+        None => (None, String::new(), None),
     };
 
     // Build the combined column names and rows, handling JOINs.
@@ -276,7 +280,11 @@ pub fn execute_select(
             raw_rows.push((0, vec![]));
         }
         let col_names: Vec<String> = table_schema.map(|s| s.columns.clone()).unwrap_or_default();
-        let tname = table_schema.map(|s| s.name.as_str());
+        let tname: Option<&str> = if !table_alias.is_empty() {
+            Some(table_alias.as_str())
+        } else {
+            table_schema.map(|s| s.name.as_str())
+        };
         (col_names, raw_rows, tname)
     };
 
@@ -327,11 +335,37 @@ pub fn execute_select(
         None
     };
 
+    // Check if resolved expressions still contain unresolved (correlated) subqueries.
+    let where_has_correlated = resolved_where
+        .as_ref()
+        .is_some_and(has_unresolved_subqueries);
+    let columns_have_correlated = resolved_columns.iter().any(|rc| match rc {
+        ResultColumn::Expr { expr, .. } => has_unresolved_subqueries(expr),
+        _ => false,
+    });
+    let order_has_correlated = resolved_order_by
+        .as_ref()
+        .is_some_and(|items| items.iter().any(|i| has_unresolved_subqueries(&i.expr)));
+    let orig_tname = original_table_name.as_deref();
+
     // Apply WHERE filter.
     let mut filtered_rows: Vec<(i64, Vec<Value>)> = Vec::new();
     for (rowid, values) in &raw_rows {
         if let Some(ref where_expr) = resolved_where {
-            let result = eval_expr(where_expr, &column_names, values, *rowid, table_name)?;
+            let eval_where = if where_has_correlated {
+                resolve_correlated(
+                    where_expr,
+                    &column_names,
+                    values,
+                    *rowid,
+                    orig_tname,
+                    pager,
+                    tables,
+                )?
+            } else {
+                where_expr.clone()
+            };
+            let result = eval_expr(&eval_where, &column_names, values, *rowid, table_name)?;
             if result.is_truthy() {
                 filtered_rows.push((*rowid, values.clone()));
             }
@@ -360,8 +394,18 @@ pub fn execute_select(
                 .collect();
             (cols, rows, synth_rows)
         } else {
-            let (cols, rows) =
-                project_columns(&resolved_columns, &column_names, &filtered_rows, table_name)?;
+            let corr_ctx = if columns_have_correlated {
+                Some((&mut *pager, tables, orig_tname))
+            } else {
+                None
+            };
+            let (cols, rows) = project_columns(
+                &resolved_columns,
+                &column_names,
+                &filtered_rows,
+                table_name,
+                corr_ctx,
+            )?;
             (cols, rows, filtered_rows)
         };
 
@@ -370,18 +414,61 @@ pub fn execute_select(
     if let Some(ref order_by) = resolved_order_by {
         // For ORDER BY after GROUP BY, evaluate expressions against result columns.
         // For regular queries, evaluate against source columns.
-        let order_col_names: Vec<&str> =
-            if stmt.group_by.is_some() || has_aggregate(&resolved_columns) {
-                result_columns.iter().map(|c| c.name.as_str()).collect()
-            } else {
-                column_names.clone()
-            };
+        let is_aggregate = stmt.group_by.is_some() || has_aggregate(&resolved_columns);
+        let order_col_names: Vec<&str> = if is_aggregate {
+            result_columns.iter().map(|c| c.name.as_str()).collect()
+        } else {
+            column_names.clone()
+        };
+
+        // Build result column alias names for ORDER BY alias resolution.
+        let result_col_aliases: Vec<&str> =
+            result_columns.iter().map(|c| c.name.as_str()).collect();
+        let num_result_cols = result_columns.len();
 
         let mut indexed: Vec<(usize, Vec<Value>)> = Vec::new();
         for (i, (rowid, values)) in filtered_rows.iter().enumerate() {
             let mut keys = Vec::new();
             for item in order_by {
-                let key = eval_expr(&item.expr, &order_col_names, values, *rowid, table_name)?;
+                // Handle ORDER BY <integer> as 1-based column index.
+                if let Expr::Literal(LiteralValue::Integer(n)) = &item.expr {
+                    let idx = *n as usize;
+                    if idx >= 1 && idx <= num_result_cols {
+                        keys.push(result_rows[i].values[idx - 1].clone());
+                        continue;
+                    }
+                }
+                // Resolve correlated subqueries if present.
+                let resolved_expr = if order_has_correlated && has_unresolved_subqueries(&item.expr)
+                {
+                    resolve_correlated(
+                        &item.expr,
+                        &order_col_names,
+                        values,
+                        *rowid,
+                        orig_tname,
+                        pager,
+                        tables,
+                    )?
+                } else {
+                    item.expr.clone()
+                };
+                // Try evaluating against source/grouped columns first.
+                let key =
+                    match eval_expr(&resolved_expr, &order_col_names, values, *rowid, table_name) {
+                        Ok(v) => v,
+                        Err(_) if !is_aggregate => {
+                            // Fall back to result column aliases for ORDER BY.
+                            eval_expr(
+                                &resolved_expr,
+                                &result_col_aliases,
+                                &result_rows[i].values,
+                                *rowid,
+                                None,
+                            )?
+                        }
+                        Err(e) => return Err(e),
+                    };
                 keys.push(key);
             }
             indexed.push((i, keys));
@@ -951,6 +1038,7 @@ fn project_columns(
     column_names: &[&str],
     rows: &[(i64, Vec<Value>)],
     table_name: Option<&str>,
+    correlated_ctx: Option<(&mut Pager, &[TableSchema], Option<&str>)>,
 ) -> Result<(Vec<ColumnInfo>, Vec<Row>)> {
     // First, resolve what each result column maps to.
     let mut col_infos: Vec<ColumnInfo> = Vec::new();
@@ -1022,21 +1110,57 @@ fn project_columns(
 
     // Project each row.
     let mut result_rows = Vec::with_capacity(rows.len());
-    for (rowid, values) in rows {
-        let mut row_values = Vec::with_capacity(projections.len());
-        for proj in &projections {
-            match proj {
-                ColumnProjection::Index(i) => {
-                    let val = values.get(*i).cloned().unwrap_or(Value::Null);
-                    row_values.push(val);
+    match correlated_ctx {
+        Some((pager, tables, orig_tname)) => {
+            for (rowid, values) in rows {
+                let mut row_values = Vec::with_capacity(projections.len());
+                for proj in &projections {
+                    match proj {
+                        ColumnProjection::Index(i) => {
+                            let val = values.get(*i).cloned().unwrap_or(Value::Null);
+                            row_values.push(val);
+                        }
+                        ColumnProjection::Expr(expr) => {
+                            let resolved = if has_unresolved_subqueries(expr) {
+                                resolve_correlated(
+                                    expr,
+                                    column_names,
+                                    values,
+                                    *rowid,
+                                    orig_tname,
+                                    pager,
+                                    tables,
+                                )?
+                            } else {
+                                expr.clone()
+                            };
+                            let val =
+                                eval_expr(&resolved, column_names, values, *rowid, table_name)?;
+                            row_values.push(val);
+                        }
+                    }
                 }
-                ColumnProjection::Expr(expr) => {
-                    let val = eval_expr(expr, column_names, values, *rowid, table_name)?;
-                    row_values.push(val);
-                }
+                result_rows.push(Row { values: row_values });
             }
         }
-        result_rows.push(Row { values: row_values });
+        None => {
+            for (rowid, values) in rows {
+                let mut row_values = Vec::with_capacity(projections.len());
+                for proj in &projections {
+                    match proj {
+                        ColumnProjection::Index(i) => {
+                            let val = values.get(*i).cloned().unwrap_or(Value::Null);
+                            row_values.push(val);
+                        }
+                        ColumnProjection::Expr(expr) => {
+                            let val = eval_expr(expr, column_names, values, *rowid, table_name)?;
+                            row_values.push(val);
+                        }
+                    }
+                }
+                result_rows.push(Row { values: row_values });
+            }
+        }
     }
 
     Ok((col_infos, result_rows))
@@ -1583,43 +1707,67 @@ fn resolve_subqueries(expr: &Expr, pager: &mut Pager, tables: &[TableSchema]) ->
             list: crate::ast::InList::Subquery(sub_select),
             negated,
         } => {
-            let result = execute_select(pager, sub_select, tables)?;
-            // Collect first column values from the subquery result.
-            let value_exprs: Vec<Expr> = result
-                .rows
-                .iter()
-                .map(|row| {
-                    let val = row.values.first().cloned().unwrap_or(Value::Null);
-                    value_to_literal_expr(&val)
-                })
-                .collect();
-            Ok(Expr::In {
-                operand: Box::new(resolve_subqueries(operand, pager, tables)?),
-                list: crate::ast::InList::Values(value_exprs),
-                negated: *negated,
-            })
+            match execute_select(pager, sub_select, tables) {
+                Ok(result) => {
+                    let value_exprs: Vec<Expr> = result
+                        .rows
+                        .iter()
+                        .map(|row| {
+                            let val = row.values.first().cloned().unwrap_or(Value::Null);
+                            value_to_literal_expr(&val)
+                        })
+                        .collect();
+                    Ok(Expr::In {
+                        operand: Box::new(resolve_subqueries(operand, pager, tables)?),
+                        list: crate::ast::InList::Values(value_exprs),
+                        negated: *negated,
+                    })
+                }
+                Err(_) => {
+                    // Likely a correlated subquery — leave unresolved for per-row evaluation.
+                    Ok(Expr::In {
+                        operand: Box::new(resolve_subqueries(operand, pager, tables)?),
+                        list: crate::ast::InList::Subquery(sub_select.clone()),
+                        negated: *negated,
+                    })
+                }
+            }
         }
         // EXISTS (SELECT ...) → 1 or 0
         Expr::Exists { subquery, negated } => {
-            let result = execute_select(pager, subquery, tables)?;
-            let exists = !result.rows.is_empty();
-            let truth = if *negated { !exists } else { exists };
-            Ok(Expr::Literal(LiteralValue::Integer(if truth {
-                1
-            } else {
-                0
-            })))
+            match execute_select(pager, subquery, tables) {
+                Ok(result) => {
+                    let exists = !result.rows.is_empty();
+                    let truth = if *negated { !exists } else { exists };
+                    Ok(Expr::Literal(LiteralValue::Integer(if truth {
+                        1
+                    } else {
+                        0
+                    })))
+                }
+                Err(_) => {
+                    // Correlated subquery — leave unresolved.
+                    Ok(expr.clone())
+                }
+            }
         }
         // Scalar subquery: (SELECT x) → literal value
         Expr::Subquery(sub_select) => {
-            let result = execute_select(pager, sub_select, tables)?;
-            let val = result
-                .rows
-                .first()
-                .and_then(|r| r.values.first())
-                .cloned()
-                .unwrap_or(Value::Null);
-            Ok(value_to_literal_expr(&val))
+            match execute_select(pager, sub_select, tables) {
+                Ok(result) => {
+                    let val = result
+                        .rows
+                        .first()
+                        .and_then(|r| r.values.first())
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    Ok(value_to_literal_expr(&val))
+                }
+                Err(_) => {
+                    // Correlated subquery — leave unresolved.
+                    Ok(expr.clone())
+                }
+            }
         }
         // Recursively resolve subqueries in compound expressions.
         Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
@@ -1678,6 +1826,70 @@ fn resolve_subqueries(expr: &Expr, pager: &mut Pager, tables: &[TableSchema]) ->
                 None => None,
             },
         }),
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            let resolved_operand = match operand {
+                Some(op) => Some(Box::new(resolve_subqueries(op, pager, tables)?)),
+                None => None,
+            };
+            let resolved_whens: Vec<(Expr, Expr)> = when_clauses
+                .iter()
+                .map(|(when_expr, then_expr)| {
+                    Ok((
+                        resolve_subqueries(when_expr, pager, tables)?,
+                        resolve_subqueries(then_expr, pager, tables)?,
+                    ))
+                })
+                .collect::<Result<_>>()?;
+            let resolved_else = match else_clause {
+                Some(el) => Some(Box::new(resolve_subqueries(el, pager, tables)?)),
+                None => None,
+            };
+            Ok(Expr::Case {
+                operand: resolved_operand,
+                when_clauses: resolved_whens,
+                else_clause: resolved_else,
+            })
+        }
+        Expr::FunctionCall { name, args } => {
+            let resolved_args = match args {
+                FunctionArgs::Wildcard => FunctionArgs::Wildcard,
+                FunctionArgs::Exprs {
+                    distinct,
+                    args: exprs,
+                } => {
+                    let resolved: Vec<Expr> = exprs
+                        .iter()
+                        .map(|e| resolve_subqueries(e, pager, tables))
+                        .collect::<Result<_>>()?;
+                    FunctionArgs::Exprs {
+                        distinct: *distinct,
+                        args: resolved,
+                    }
+                }
+            };
+            Ok(Expr::FunctionCall {
+                name: name.clone(),
+                args: resolved_args,
+            })
+        }
+        Expr::Cast {
+            expr: inner,
+            type_name,
+        } => Ok(Expr::Cast {
+            expr: Box::new(resolve_subqueries(inner, pager, tables)?),
+            type_name: type_name.clone(),
+        }),
+        Expr::Collate {
+            expr: inner,
+            collation,
+        } => Ok(Expr::Collate {
+            expr: Box::new(resolve_subqueries(inner, pager, tables)?),
+            collation: collation.clone(),
+        }),
         // Leaf expressions: no subqueries to resolve.
         _ => Ok(expr.clone()),
     }
@@ -1691,6 +1903,506 @@ fn value_to_literal_expr(val: &Value) -> Expr {
         Value::Real(f) => Expr::Literal(LiteralValue::Real(*f)),
         Value::Text(s) => Expr::Literal(LiteralValue::String(s.clone())),
         Value::Blob(b) => Expr::Literal(LiteralValue::Blob(b.clone())),
+    }
+}
+
+/// Check if an expression contains any unresolved subqueries.
+fn has_unresolved_subqueries(expr: &Expr) -> bool {
+    match expr {
+        Expr::Subquery(_) | Expr::Exists { .. } => true,
+        Expr::In {
+            list: crate::ast::InList::Subquery(_),
+            ..
+        } => true,
+        Expr::BinaryOp { left, right, .. } => {
+            has_unresolved_subqueries(left) || has_unresolved_subqueries(right)
+        }
+        Expr::UnaryOp { operand, .. } => has_unresolved_subqueries(operand),
+        Expr::Parenthesized(inner) => has_unresolved_subqueries(inner),
+        Expr::IsNull { operand, .. } => has_unresolved_subqueries(operand),
+        Expr::Between {
+            operand, low, high, ..
+        } => {
+            has_unresolved_subqueries(operand)
+                || has_unresolved_subqueries(low)
+                || has_unresolved_subqueries(high)
+        }
+        Expr::In {
+            operand,
+            list: crate::ast::InList::Values(exprs),
+            ..
+        } => has_unresolved_subqueries(operand) || exprs.iter().any(has_unresolved_subqueries),
+        Expr::Like {
+            operand, pattern, ..
+        } => has_unresolved_subqueries(operand) || has_unresolved_subqueries(pattern),
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|o| has_unresolved_subqueries(o))
+                || when_clauses
+                    .iter()
+                    .any(|(w, t)| has_unresolved_subqueries(w) || has_unresolved_subqueries(t))
+                || else_clause
+                    .as_ref()
+                    .is_some_and(|e| has_unresolved_subqueries(e))
+        }
+        Expr::FunctionCall { args, .. } => match args {
+            FunctionArgs::Wildcard => false,
+            FunctionArgs::Exprs { args: exprs, .. } => exprs.iter().any(has_unresolved_subqueries),
+        },
+        Expr::Cast { expr, .. } => has_unresolved_subqueries(expr),
+        Expr::Collate { expr, .. } => has_unresolved_subqueries(expr),
+        _ => false,
+    }
+}
+
+/// Substitute outer column references in an expression with literal values.
+/// Any column ref qualified with `outer_table_name` that does NOT match
+/// `inner_table_alias` is replaced with the corresponding outer row value.
+fn substitute_outer_refs(
+    expr: &Expr,
+    outer_col_names: &[&str],
+    outer_values: &[Value],
+    outer_rowid: i64,
+    outer_table_name: &str,
+    inner_table_alias: &str,
+) -> Expr {
+    match expr {
+        Expr::ColumnRef {
+            table: Some(t),
+            column,
+        } => {
+            // If the qualifier matches the outer table but NOT the inner alias,
+            // it's an outer reference — substitute with a literal value.
+            if t.eq_ignore_ascii_case(outer_table_name)
+                && !t.eq_ignore_ascii_case(inner_table_alias)
+            {
+                // Check for rowid aliases.
+                if column.eq_ignore_ascii_case("rowid")
+                    || column.eq_ignore_ascii_case("_rowid_")
+                    || column.eq_ignore_ascii_case("oid")
+                {
+                    return value_to_literal_expr(&Value::Integer(outer_rowid));
+                }
+                // Look up the column in outer_col_names.
+                if let Some(idx) = outer_col_names
+                    .iter()
+                    .position(|&n| n.eq_ignore_ascii_case(column))
+                {
+                    return value_to_literal_expr(outer_values.get(idx).unwrap_or(&Value::Null));
+                }
+            }
+            expr.clone()
+        }
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(substitute_outer_refs(
+                left,
+                outer_col_names,
+                outer_values,
+                outer_rowid,
+                outer_table_name,
+                inner_table_alias,
+            )),
+            op: *op,
+            right: Box::new(substitute_outer_refs(
+                right,
+                outer_col_names,
+                outer_values,
+                outer_rowid,
+                outer_table_name,
+                inner_table_alias,
+            )),
+        },
+        Expr::UnaryOp { op, operand } => Expr::UnaryOp {
+            op: *op,
+            operand: Box::new(substitute_outer_refs(
+                operand,
+                outer_col_names,
+                outer_values,
+                outer_rowid,
+                outer_table_name,
+                inner_table_alias,
+            )),
+        },
+        Expr::Parenthesized(inner) => Expr::Parenthesized(Box::new(substitute_outer_refs(
+            inner,
+            outer_col_names,
+            outer_values,
+            outer_rowid,
+            outer_table_name,
+            inner_table_alias,
+        ))),
+        Expr::IsNull { operand, negated } => Expr::IsNull {
+            operand: Box::new(substitute_outer_refs(
+                operand,
+                outer_col_names,
+                outer_values,
+                outer_rowid,
+                outer_table_name,
+                inner_table_alias,
+            )),
+            negated: *negated,
+        },
+        Expr::Between {
+            operand,
+            low,
+            high,
+            negated,
+        } => Expr::Between {
+            operand: Box::new(substitute_outer_refs(
+                operand,
+                outer_col_names,
+                outer_values,
+                outer_rowid,
+                outer_table_name,
+                inner_table_alias,
+            )),
+            low: Box::new(substitute_outer_refs(
+                low,
+                outer_col_names,
+                outer_values,
+                outer_rowid,
+                outer_table_name,
+                inner_table_alias,
+            )),
+            high: Box::new(substitute_outer_refs(
+                high,
+                outer_col_names,
+                outer_values,
+                outer_rowid,
+                outer_table_name,
+                inner_table_alias,
+            )),
+            negated: *negated,
+        },
+        Expr::FunctionCall { name, args } => {
+            let new_args = match args {
+                FunctionArgs::Wildcard => FunctionArgs::Wildcard,
+                FunctionArgs::Exprs {
+                    distinct,
+                    args: exprs,
+                } => FunctionArgs::Exprs {
+                    distinct: *distinct,
+                    args: exprs
+                        .iter()
+                        .map(|e| {
+                            substitute_outer_refs(
+                                e,
+                                outer_col_names,
+                                outer_values,
+                                outer_rowid,
+                                outer_table_name,
+                                inner_table_alias,
+                            )
+                        })
+                        .collect(),
+                },
+            };
+            Expr::FunctionCall {
+                name: name.clone(),
+                args: new_args,
+            }
+        }
+        _ => expr.clone(),
+    }
+}
+
+/// Get the alias (or name) of the FROM table in a SelectStatement.
+fn get_inner_table_alias(stmt: &SelectStatement) -> Option<String> {
+    stmt.from.as_ref().and_then(|from| match &from.table {
+        crate::ast::TableRef::Table { name, alias } => {
+            Some(alias.as_deref().unwrap_or(name.as_str()).to_string())
+        }
+        _ => None,
+    })
+}
+
+/// Resolve correlated subqueries in an expression by substituting outer column
+/// values and then executing the subquery. Called per-row in the outer query.
+fn resolve_correlated(
+    expr: &Expr,
+    outer_col_names: &[&str],
+    outer_values: &[Value],
+    outer_rowid: i64,
+    outer_table_name: Option<&str>,
+    pager: &mut Pager,
+    tables: &[TableSchema],
+) -> Result<Expr> {
+    match expr {
+        Expr::Subquery(sub_select) => {
+            let outer_tn = outer_table_name.unwrap_or("");
+            let inner_alias = get_inner_table_alias(sub_select).unwrap_or_default();
+            // Substitute outer refs in the subquery's WHERE clause.
+            let mut modified = sub_select.as_ref().clone();
+            if let Some(ref where_expr) = modified.where_clause {
+                modified.where_clause = Some(substitute_outer_refs(
+                    where_expr,
+                    outer_col_names,
+                    outer_values,
+                    outer_rowid,
+                    outer_tn,
+                    &inner_alias,
+                ));
+            }
+            // Also substitute in SELECT columns (for correlated refs there).
+            modified.columns = modified
+                .columns
+                .iter()
+                .map(|rc| match rc {
+                    ResultColumn::Expr { expr: e, alias } => ResultColumn::Expr {
+                        expr: substitute_outer_refs(
+                            e,
+                            outer_col_names,
+                            outer_values,
+                            outer_rowid,
+                            outer_tn,
+                            &inner_alias,
+                        ),
+                        alias: alias.clone(),
+                    },
+                    other => other.clone(),
+                })
+                .collect();
+            let result = execute_select(pager, &modified, tables)?;
+            let val = result
+                .rows
+                .first()
+                .and_then(|r| r.values.first())
+                .cloned()
+                .unwrap_or(Value::Null);
+            Ok(value_to_literal_expr(&val))
+        }
+        Expr::Exists { subquery, negated } => {
+            let outer_tn = outer_table_name.unwrap_or("");
+            let inner_alias = get_inner_table_alias(subquery).unwrap_or_default();
+            let mut modified = subquery.as_ref().clone();
+            if let Some(ref where_expr) = modified.where_clause {
+                modified.where_clause = Some(substitute_outer_refs(
+                    where_expr,
+                    outer_col_names,
+                    outer_values,
+                    outer_rowid,
+                    outer_tn,
+                    &inner_alias,
+                ));
+            }
+            let result = execute_select(pager, &modified, tables)?;
+            let exists = !result.rows.is_empty();
+            let truth = if *negated { !exists } else { exists };
+            Ok(Expr::Literal(LiteralValue::Integer(if truth {
+                1
+            } else {
+                0
+            })))
+        }
+        Expr::In {
+            operand,
+            list: crate::ast::InList::Subquery(sub_select),
+            negated,
+        } => {
+            let outer_tn = outer_table_name.unwrap_or("");
+            let inner_alias = get_inner_table_alias(sub_select).unwrap_or_default();
+            let mut modified = sub_select.as_ref().clone();
+            if let Some(ref where_expr) = modified.where_clause {
+                modified.where_clause = Some(substitute_outer_refs(
+                    where_expr,
+                    outer_col_names,
+                    outer_values,
+                    outer_rowid,
+                    outer_tn,
+                    &inner_alias,
+                ));
+            }
+            let result = execute_select(pager, &modified, tables)?;
+            let value_exprs: Vec<Expr> = result
+                .rows
+                .iter()
+                .map(|row| {
+                    let val = row.values.first().cloned().unwrap_or(Value::Null);
+                    value_to_literal_expr(&val)
+                })
+                .collect();
+            Ok(Expr::In {
+                operand: Box::new(resolve_correlated(
+                    operand,
+                    outer_col_names,
+                    outer_values,
+                    outer_rowid,
+                    outer_table_name,
+                    pager,
+                    tables,
+                )?),
+                list: crate::ast::InList::Values(value_exprs),
+                negated: *negated,
+            })
+        }
+        // Recurse into compound expressions.
+        Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
+            left: Box::new(resolve_correlated(
+                left,
+                outer_col_names,
+                outer_values,
+                outer_rowid,
+                outer_table_name,
+                pager,
+                tables,
+            )?),
+            op: *op,
+            right: Box::new(resolve_correlated(
+                right,
+                outer_col_names,
+                outer_values,
+                outer_rowid,
+                outer_table_name,
+                pager,
+                tables,
+            )?),
+        }),
+        Expr::UnaryOp { op, operand } => Ok(Expr::UnaryOp {
+            op: *op,
+            operand: Box::new(resolve_correlated(
+                operand,
+                outer_col_names,
+                outer_values,
+                outer_rowid,
+                outer_table_name,
+                pager,
+                tables,
+            )?),
+        }),
+        Expr::Parenthesized(inner) => Ok(Expr::Parenthesized(Box::new(resolve_correlated(
+            inner,
+            outer_col_names,
+            outer_values,
+            outer_rowid,
+            outer_table_name,
+            pager,
+            tables,
+        )?))),
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            let resolved_operand = match operand {
+                Some(op) => Some(Box::new(resolve_correlated(
+                    op,
+                    outer_col_names,
+                    outer_values,
+                    outer_rowid,
+                    outer_table_name,
+                    pager,
+                    tables,
+                )?)),
+                None => None,
+            };
+            let resolved_whens: Vec<(Expr, Expr)> = when_clauses
+                .iter()
+                .map(|(w, t)| {
+                    Ok((
+                        resolve_correlated(
+                            w,
+                            outer_col_names,
+                            outer_values,
+                            outer_rowid,
+                            outer_table_name,
+                            pager,
+                            tables,
+                        )?,
+                        resolve_correlated(
+                            t,
+                            outer_col_names,
+                            outer_values,
+                            outer_rowid,
+                            outer_table_name,
+                            pager,
+                            tables,
+                        )?,
+                    ))
+                })
+                .collect::<Result<_>>()?;
+            let resolved_else = match else_clause {
+                Some(el) => Some(Box::new(resolve_correlated(
+                    el,
+                    outer_col_names,
+                    outer_values,
+                    outer_rowid,
+                    outer_table_name,
+                    pager,
+                    tables,
+                )?)),
+                None => None,
+            };
+            Ok(Expr::Case {
+                operand: resolved_operand,
+                when_clauses: resolved_whens,
+                else_clause: resolved_else,
+            })
+        }
+        Expr::FunctionCall { name, args } => {
+            let resolved_args = match args {
+                FunctionArgs::Wildcard => FunctionArgs::Wildcard,
+                FunctionArgs::Exprs {
+                    distinct,
+                    args: exprs,
+                } => {
+                    let resolved: Vec<Expr> = exprs
+                        .iter()
+                        .map(|e| {
+                            resolve_correlated(
+                                e,
+                                outer_col_names,
+                                outer_values,
+                                outer_rowid,
+                                outer_table_name,
+                                pager,
+                                tables,
+                            )
+                        })
+                        .collect::<Result<_>>()?;
+                    FunctionArgs::Exprs {
+                        distinct: *distinct,
+                        args: resolved,
+                    }
+                }
+            };
+            Ok(Expr::FunctionCall {
+                name: name.clone(),
+                args: resolved_args,
+            })
+        }
+        Expr::Cast {
+            expr: inner,
+            type_name,
+        } => Ok(Expr::Cast {
+            expr: Box::new(resolve_correlated(
+                inner,
+                outer_col_names,
+                outer_values,
+                outer_rowid,
+                outer_table_name,
+                pager,
+                tables,
+            )?),
+            type_name: type_name.clone(),
+        }),
+        Expr::IsNull { operand, negated } => Ok(Expr::IsNull {
+            operand: Box::new(resolve_correlated(
+                operand,
+                outer_col_names,
+                outer_values,
+                outer_rowid,
+                outer_table_name,
+                pager,
+                tables,
+            )?),
+            negated: *negated,
+        }),
+        _ => Ok(expr.clone()),
     }
 }
 

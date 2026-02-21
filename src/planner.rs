@@ -56,6 +56,8 @@ impl Database {
             Statement::Delete(delete) => self.execute_delete(delete),
             Statement::Update(update) => self.execute_update(update),
             Statement::DropTable(drop) => self.execute_drop_table(drop),
+            Statement::CreateIndex(ci) => self.execute_create_index(ci),
+            Statement::DropIndex(di) => self.execute_drop_index(di),
             Statement::Explain(inner) => {
                 let description = format!("{inner:?}");
                 Ok(QueryResult {
@@ -147,6 +149,10 @@ impl Database {
             })?
             .clone();
 
+        // Find indexes on this table.
+        let mut indexes =
+            build_index_schemas(&schema_entries, &schema.name, &schema.columns);
+
         let rows = match &insert.source {
             InsertSource::Values(row_list) => {
                 let mut result_rows = Vec::new();
@@ -233,6 +239,17 @@ impl Database {
                 root_page = new_root;
             }
 
+            // Maintain indexes: build the full row values (with IPK restored) for index insertion.
+            if !indexes.is_empty() {
+                let mut full_values = values;
+                if let Some(pk_idx) = schema.rowid_column {
+                    if pk_idx < full_values.len() {
+                        full_values[pk_idx] = Value::Integer(rowid);
+                    }
+                }
+                insert_into_indexes(&mut self.pager, &mut indexes, &full_values, rowid)?;
+            }
+
             changes += 1;
         }
 
@@ -260,6 +277,9 @@ impl Database {
                 RsqliteError::Runtime(format!("no such table: {}", delete.table))
             })?
             .clone();
+
+        // Find indexes on this table.
+        let indexes = build_index_schemas(&schema_entries, &schema.name, &schema.columns);
 
         // Scan to find rows matching the WHERE clause.
         let column_names: Vec<&str> = schema.columns.iter().map(|c| c.as_str()).collect();
@@ -294,8 +314,12 @@ impl Database {
         }
 
         let changes = to_delete.len() as i64;
-        for rowid in to_delete {
-            btree::btree_delete(&mut self.pager, schema.root_page, rowid)?;
+        for rowid in &to_delete {
+            // Remove from indexes first, then from the table.
+            if !indexes.is_empty() {
+                delete_from_indexes(&mut self.pager, &indexes, *rowid)?;
+            }
+            btree::btree_delete(&mut self.pager, schema.root_page, *rowid)?;
         }
 
         self.pager.flush()?;
@@ -322,6 +346,9 @@ impl Database {
                 RsqliteError::Runtime(format!("no such table: {}", update.table))
             })?
             .clone();
+
+        // Find indexes on this table.
+        let mut indexes = build_index_schemas(&schema_entries, &schema.name, &schema.columns);
 
         let column_names: Vec<&str> = schema.columns.iter().map(|c| c.as_str()).collect();
         let table_name = Some(schema.name.as_str());
@@ -376,6 +403,11 @@ impl Database {
         let mut root_page = schema.root_page;
 
         for (rowid, mut values) in updates {
+            // Remove old index entries.
+            if !indexes.is_empty() {
+                delete_from_indexes(&mut self.pager, &indexes, rowid)?;
+            }
+
             // Delete old row.
             btree::btree_delete(&mut self.pager, root_page, rowid)?;
 
@@ -392,6 +424,17 @@ impl Database {
             if new_root != root_page {
                 update_root_page(&mut self.pager, &schema.name, new_root)?;
                 root_page = new_root;
+            }
+
+            // Insert new index entries.
+            if !indexes.is_empty() {
+                let mut full_values = values;
+                if let Some(pk_idx) = schema.rowid_column {
+                    if pk_idx < full_values.len() {
+                        full_values[pk_idx] = Value::Integer(rowid);
+                    }
+                }
+                insert_into_indexes(&mut self.pager, &mut indexes, &full_values, rowid)?;
             }
         }
 
@@ -452,6 +495,184 @@ impl Database {
         Ok(empty_result())
     }
 
+    /// Execute a CREATE INDEX statement.
+    fn execute_create_index(
+        &mut self,
+        ci: &crate::ast::CreateIndexStatement,
+    ) -> Result<QueryResult> {
+        let schema_entries = schema::read_schema(&mut self.pager)?;
+
+        // Check if the index already exists.
+        if schema_entries
+            .iter()
+            .any(|e| e.entry_type == "index" && e.name.eq_ignore_ascii_case(&ci.name))
+        {
+            if ci.if_not_exists {
+                return Ok(empty_result());
+            }
+            return Err(RsqliteError::Runtime(format!(
+                "index {} already exists",
+                ci.name
+            )));
+        }
+
+        // Verify the table exists and get its schema.
+        let table_schemas = build_table_schemas(&schema_entries)?;
+        let table_schema = table_schemas
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(&ci.table))
+            .ok_or_else(|| RsqliteError::Runtime(format!("no such table: {}", ci.table)))?
+            .clone();
+
+        // Verify all indexed columns exist.
+        let col_indices: Vec<usize> = ci
+            .columns
+            .iter()
+            .map(|ic| {
+                table_schema
+                    .columns
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case(&ic.name))
+                    .ok_or_else(|| {
+                        RsqliteError::Runtime(format!(
+                            "table {} has no column named {}",
+                            ci.table, ic.name
+                        ))
+                    })
+            })
+            .collect::<Result<_>>()?;
+
+        // Allocate a new page for the index B-tree.
+        let root_page = self.pager.allocate_page()?;
+        btree::init_table_leaf_page(&mut self.pager, root_page)?;
+
+        // Build index entries from existing table data.
+        let mut idx_root = root_page;
+        let mut cursor = btree::BTreeCursor::new(table_schema.root_page);
+        cursor.move_to_first(&mut self.pager)?;
+        let mut idx_rowid = 0i64;
+
+        while cursor.is_valid() {
+            let table_rowid = cursor.current_rowid(&mut self.pager)?;
+            let payload = cursor.current_payload(&mut self.pager)?;
+            let mut values = record::decode_record(&payload)?;
+
+            // Substitute INTEGER PRIMARY KEY value.
+            if let Some(pk_idx) = table_schema.rowid_column {
+                if pk_idx < values.len() {
+                    values[pk_idx] = Value::Integer(table_rowid);
+                }
+            }
+
+            // Build the index entry: indexed column values + table rowid.
+            let mut index_values: Vec<Value> = col_indices
+                .iter()
+                .map(|&i| values.get(i).cloned().unwrap_or(Value::Null))
+                .collect();
+            index_values.push(Value::Integer(table_rowid));
+
+            let index_payload = record::encode_record(&index_values);
+            idx_rowid += 1;
+            let new_root =
+                btree::btree_insert(&mut self.pager, idx_root, idx_rowid, &index_payload)?;
+            if new_root != idx_root {
+                idx_root = new_root;
+            }
+
+            cursor.move_to_next(&mut self.pager)?;
+        }
+
+        // If root changed, use the final root for the schema entry.
+        let final_root = idx_root;
+
+        // Reconstruct the CREATE INDEX SQL.
+        let unique_str = if ci.unique { "UNIQUE " } else { "" };
+        let cols_str: Vec<String> = ci.columns.iter().map(|c| c.name.clone()).collect();
+        let sql = format!(
+            "CREATE {}INDEX {} ON {}({})",
+            unique_str,
+            ci.name,
+            ci.table,
+            cols_str.join(", ")
+        );
+
+        // Insert into sqlite_master.
+        let master_values = vec![
+            Value::Text("index".into()),
+            Value::Text(ci.name.clone()),
+            Value::Text(ci.table.clone()),
+            Value::Integer(final_root as i64),
+            Value::Text(sql),
+        ];
+        let master_payload = record::encode_record(&master_values);
+        let master_rowid = btree::find_max_rowid(&mut self.pager, 1)? + 1;
+        let new_master_root =
+            btree::btree_insert(&mut self.pager, 1, master_rowid, &master_payload)?;
+        if new_master_root != 1 {
+            return Err(RsqliteError::Runtime(
+                "sqlite_master root page split is not yet supported".into(),
+            ));
+        }
+
+        self.pager.header.schema_cookie += 1;
+        self.pager.flush()?;
+
+        Ok(empty_result())
+    }
+
+    /// Execute a DROP INDEX statement.
+    fn execute_drop_index(
+        &mut self,
+        drop: &crate::ast::DropIndexStatement,
+    ) -> Result<QueryResult> {
+        let schema_entries = schema::read_schema(&mut self.pager)?;
+
+        let found = schema_entries
+            .iter()
+            .any(|e| e.entry_type == "index" && e.name.eq_ignore_ascii_case(&drop.name));
+
+        if !found {
+            if drop.if_exists {
+                return Ok(empty_result());
+            }
+            return Err(RsqliteError::Runtime(format!(
+                "no such index: {}",
+                drop.name
+            )));
+        }
+
+        // Find and delete the sqlite_master entry.
+        let mut cursor = btree::BTreeCursor::new(1);
+        cursor.move_to_first(&mut self.pager)?;
+
+        let mut rowid_to_delete = None;
+        while cursor.is_valid() {
+            let rowid = cursor.current_rowid(&mut self.pager)?;
+            let payload = cursor.current_payload(&mut self.pager)?;
+            let values = record::decode_record(&payload)?;
+            if values.len() >= 2 {
+                if let (Value::Text(ref entry_type), Value::Text(ref name)) =
+                    (&values[0], &values[1])
+                {
+                    if entry_type == "index" && name.eq_ignore_ascii_case(&drop.name) {
+                        rowid_to_delete = Some(rowid);
+                        break;
+                    }
+                }
+            }
+            cursor.move_to_next(&mut self.pager)?;
+        }
+
+        if let Some(rowid) = rowid_to_delete {
+            btree::btree_delete(&mut self.pager, 1, rowid)?;
+        }
+
+        self.pager.header.schema_cookie += 1;
+        self.pager.flush()?;
+
+        Ok(empty_result())
+    }
+
     /// Read the database schema (all entries from sqlite_master).
     pub fn schema(&mut self) -> Result<Vec<SchemaEntry>> {
         schema::read_schema(&mut self.pager)
@@ -493,6 +714,127 @@ fn build_table_schemas(entries: &[SchemaEntry]) -> Result<Vec<TableSchema>> {
     }
 
     Ok(schemas)
+}
+
+/// Schema information for an index, used during write operations.
+#[derive(Debug, Clone)]
+struct IndexSchema {
+    name: String,
+    #[allow(dead_code)]
+    table_name: String,
+    root_page: u32,
+    /// Column indices into the parent table's column list.
+    column_indices: Vec<usize>,
+    #[allow(dead_code)]
+    unique: bool,
+}
+
+/// Build IndexSchema structs for a given table from schema entries.
+fn build_index_schemas(
+    entries: &[SchemaEntry],
+    table_name: &str,
+    table_columns: &[String],
+) -> Vec<IndexSchema> {
+    let mut indexes = Vec::new();
+
+    for entry in entries {
+        if entry.entry_type != "index" {
+            continue;
+        }
+        if !entry.tbl_name.eq_ignore_ascii_case(table_name) {
+            continue;
+        }
+        // Skip autoindexes (those with NULL sql).
+        let sql = match &entry.sql {
+            Some(s) => s,
+            None => continue,
+        };
+
+        // Parse the CREATE INDEX SQL to get column names.
+        if let Ok(stmt) = crate::parser::parse(sql) {
+            if let Statement::CreateIndex(ci) = stmt {
+                let col_indices: Vec<usize> = ci
+                    .columns
+                    .iter()
+                    .filter_map(|ic| {
+                        table_columns
+                            .iter()
+                            .position(|c| c.eq_ignore_ascii_case(&ic.name))
+                    })
+                    .collect();
+
+                if col_indices.len() == ci.columns.len() {
+                    indexes.push(IndexSchema {
+                        name: entry.name.clone(),
+                        table_name: entry.tbl_name.clone(),
+                        root_page: entry.rootpage as u32,
+                        column_indices: col_indices,
+                        unique: ci.unique,
+                    });
+                }
+            }
+        }
+    }
+
+    indexes
+}
+
+/// Insert a row into all indexes for a table.
+fn insert_into_indexes(
+    pager: &mut Pager,
+    indexes: &mut [IndexSchema],
+    row_values: &[Value],
+    table_rowid: i64,
+) -> Result<()> {
+    for index in indexes.iter_mut() {
+        let mut index_values: Vec<Value> = index
+            .column_indices
+            .iter()
+            .map(|&i| row_values.get(i).cloned().unwrap_or(Value::Null))
+            .collect();
+        index_values.push(Value::Integer(table_rowid));
+
+        let index_payload = record::encode_record(&index_values);
+        let idx_rowid = btree::find_max_rowid(pager, index.root_page)? + 1;
+        let new_root =
+            btree::btree_insert(pager, index.root_page, idx_rowid, &index_payload)?;
+        if new_root != index.root_page {
+            update_root_page(pager, &index.name, new_root)?;
+            index.root_page = new_root;
+        }
+    }
+    Ok(())
+}
+
+/// Delete a row from all indexes for a table by scanning for the matching table rowid.
+fn delete_from_indexes(
+    pager: &mut Pager,
+    indexes: &[IndexSchema],
+    table_rowid: i64,
+) -> Result<()> {
+    for index in indexes {
+        // Scan the index to find the entry with this table rowid.
+        let mut cursor = btree::BTreeCursor::new(index.root_page);
+        cursor.move_to_first(pager)?;
+
+        let num_cols = index.column_indices.len();
+
+        while cursor.is_valid() {
+            let idx_rowid = cursor.current_rowid(pager)?;
+            let payload = cursor.current_payload(pager)?;
+            let values = record::decode_record(&payload)?;
+
+            // The last value in the index record is the table rowid.
+            if let Some(Value::Integer(stored_rowid)) = values.get(num_cols) {
+                if *stored_rowid == table_rowid {
+                    btree::btree_delete(pager, index.root_page, idx_rowid)?;
+                    break;
+                }
+            }
+            cursor.move_to_next(pager)?;
+        }
+    }
+    Ok(())
 }
 
 /// Extract column names and INTEGER PRIMARY KEY index from a CREATE TABLE SQL.
@@ -2053,5 +2395,255 @@ mod tests {
         let mut db = Database::in_memory();
         let r = db.execute("PRAGMA page_size").unwrap();
         assert_eq!(r.rows[0].values[0], Value::Integer(4096));
+    }
+
+    #[test]
+    fn test_create_index_basic() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price REAL)")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (1, 'apple', 1.50)")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (2, 'banana', 0.75)")
+            .unwrap();
+        db.execute("INSERT INTO items VALUES (3, 'cherry', 2.00)")
+            .unwrap();
+
+        // Create an index.
+        db.execute("CREATE INDEX idx_items_name ON items(name)")
+            .unwrap();
+
+        // Verify the index appears in the schema.
+        let entries = db.schema().unwrap();
+        let idx = entries
+            .iter()
+            .find(|e| e.entry_type == "index" && e.name == "idx_items_name");
+        assert!(idx.is_some(), "index should appear in schema");
+
+        // Data should still be queryable.
+        let r = db
+            .execute("SELECT name FROM items ORDER BY name")
+            .unwrap();
+        assert_eq!(r.rows.len(), 3);
+        assert_eq!(r.rows[0].values[0], Value::Text("apple".into()));
+        assert_eq!(r.rows[1].values[0], Value::Text("banana".into()));
+        assert_eq!(r.rows[2].values[0], Value::Text("cherry".into()));
+    }
+
+    #[test]
+    fn test_create_index_if_not_exists() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (a TEXT)").unwrap();
+        db.execute("CREATE INDEX idx_t_a ON t(a)").unwrap();
+
+        // Without IF NOT EXISTS, should fail.
+        let result = db.execute("CREATE INDEX idx_t_a ON t(a)");
+        assert!(result.is_err());
+
+        // With IF NOT EXISTS, should succeed silently.
+        db.execute("CREATE INDEX IF NOT EXISTS idx_t_a ON t(a)")
+            .unwrap();
+    }
+
+    #[test]
+    fn test_drop_index() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (a TEXT, b INTEGER)").unwrap();
+        db.execute("CREATE INDEX idx_t_a ON t(a)").unwrap();
+
+        // Index should exist.
+        let entries = db.schema().unwrap();
+        assert!(entries.iter().any(|e| e.name == "idx_t_a"));
+
+        // Drop it.
+        db.execute("DROP INDEX idx_t_a").unwrap();
+
+        // Index should be gone.
+        let entries = db.schema().unwrap();
+        assert!(!entries.iter().any(|e| e.name == "idx_t_a"));
+    }
+
+    #[test]
+    fn test_drop_index_if_exists() {
+        let mut db = Database::in_memory();
+
+        // Without IF EXISTS, should fail.
+        assert!(db.execute("DROP INDEX no_such_idx").is_err());
+
+        // With IF EXISTS, should succeed silently.
+        db.execute("DROP INDEX IF EXISTS no_such_idx").unwrap();
+    }
+
+    #[test]
+    fn test_index_maintained_on_insert() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        db.execute("CREATE INDEX idx_t_val ON t(val)").unwrap();
+
+        // Insert rows after index creation - index should be maintained.
+        db.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'world')").unwrap();
+
+        // Verify the index has entries by scanning it.
+        let entries = db.schema().unwrap();
+        let idx_entry = entries
+            .iter()
+            .find(|e| e.name == "idx_t_val")
+            .unwrap();
+        let idx_root = idx_entry.rootpage as u32;
+
+        // Read index entries.
+        let mut cursor = btree::BTreeCursor::new(idx_root);
+        cursor.move_to_first(&mut db.pager).unwrap();
+        let mut index_entries = Vec::new();
+        while cursor.is_valid() {
+            let payload = cursor.current_payload(&mut db.pager).unwrap();
+            let vals = record::decode_record(&payload).unwrap();
+            index_entries.push(vals);
+            cursor.move_to_next(&mut db.pager).unwrap();
+        }
+
+        // Should have 2 index entries (one per row).
+        assert_eq!(index_entries.len(), 2);
+        // Each entry should be (val_text, table_rowid).
+        assert!(index_entries
+            .iter()
+            .any(|v| v[0] == Value::Text("hello".into())));
+        assert!(index_entries
+            .iter()
+            .any(|v| v[0] == Value::Text("world".into())));
+    }
+
+    #[test]
+    fn test_index_maintained_on_delete() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'alpha')").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'beta')").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 'gamma')").unwrap();
+        db.execute("CREATE INDEX idx_t_val ON t(val)").unwrap();
+
+        // Delete a row.
+        db.execute("DELETE FROM t WHERE id = 2").unwrap();
+
+        // Verify index no longer contains the deleted entry.
+        let entries = db.schema().unwrap();
+        let idx_entry = entries
+            .iter()
+            .find(|e| e.name == "idx_t_val")
+            .unwrap();
+        let idx_root = idx_entry.rootpage as u32;
+
+        let mut cursor = btree::BTreeCursor::new(idx_root);
+        cursor.move_to_first(&mut db.pager).unwrap();
+        let mut index_entries = Vec::new();
+        while cursor.is_valid() {
+            let payload = cursor.current_payload(&mut db.pager).unwrap();
+            let vals = record::decode_record(&payload).unwrap();
+            index_entries.push(vals);
+            cursor.move_to_next(&mut db.pager).unwrap();
+        }
+
+        assert_eq!(index_entries.len(), 2);
+        assert!(!index_entries
+            .iter()
+            .any(|v| v[0] == Value::Text("beta".into())));
+        assert!(index_entries
+            .iter()
+            .any(|v| v[0] == Value::Text("alpha".into())));
+        assert!(index_entries
+            .iter()
+            .any(|v| v[0] == Value::Text("gamma".into())));
+    }
+
+    #[test]
+    fn test_index_maintained_on_update() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'old_a')").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'old_b')").unwrap();
+        db.execute("CREATE INDEX idx_t_val ON t(val)").unwrap();
+
+        // Update a row.
+        db.execute("UPDATE t SET val = 'new_b' WHERE id = 2")
+            .unwrap();
+
+        // Verify the index reflects the update.
+        let entries = db.schema().unwrap();
+        let idx_entry = entries
+            .iter()
+            .find(|e| e.name == "idx_t_val")
+            .unwrap();
+        let idx_root = idx_entry.rootpage as u32;
+
+        let mut cursor = btree::BTreeCursor::new(idx_root);
+        cursor.move_to_first(&mut db.pager).unwrap();
+        let mut index_vals: Vec<Value> = Vec::new();
+        while cursor.is_valid() {
+            let payload = cursor.current_payload(&mut db.pager).unwrap();
+            let vals = record::decode_record(&payload).unwrap();
+            index_vals.push(vals[0].clone());
+            cursor.move_to_next(&mut db.pager).unwrap();
+        }
+
+        assert_eq!(index_vals.len(), 2);
+        assert!(index_vals.contains(&Value::Text("old_a".into())));
+        assert!(index_vals.contains(&Value::Text("new_b".into())));
+        assert!(!index_vals.contains(&Value::Text("old_b".into())));
+    }
+
+    #[test]
+    fn test_create_unique_index() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a@b.com')").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'c@d.com')").unwrap();
+
+        db.execute("CREATE UNIQUE INDEX idx_t_email ON t(email)")
+            .unwrap();
+
+        // Schema should show UNIQUE.
+        let entries = db.schema().unwrap();
+        let idx = entries
+            .iter()
+            .find(|e| e.name == "idx_t_email")
+            .unwrap();
+        assert!(idx.sql.as_ref().unwrap().contains("UNIQUE"));
+    }
+
+    #[test]
+    fn test_create_multi_column_index() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (a TEXT, b INTEGER, c REAL)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES ('x', 1, 1.0)").unwrap();
+        db.execute("INSERT INTO t VALUES ('y', 2, 2.0)").unwrap();
+
+        db.execute("CREATE INDEX idx_t_ab ON t(a, b)").unwrap();
+
+        // Verify the index has entries.
+        let entries = db.schema().unwrap();
+        let idx_entry = entries
+            .iter()
+            .find(|e| e.name == "idx_t_ab")
+            .unwrap();
+        let idx_root = idx_entry.rootpage as u32;
+
+        let mut cursor = btree::BTreeCursor::new(idx_root);
+        cursor.move_to_first(&mut db.pager).unwrap();
+        let mut count = 0;
+        while cursor.is_valid() {
+            let payload = cursor.current_payload(&mut db.pager).unwrap();
+            let vals = record::decode_record(&payload).unwrap();
+            // Each entry: (a, b, rowid) = 3 values.
+            assert_eq!(vals.len(), 3);
+            count += 1;
+            cursor.move_to_next(&mut db.pager).unwrap();
+        }
+        assert_eq!(count, 2);
     }
 }

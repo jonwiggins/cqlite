@@ -4,6 +4,14 @@ A SQLite-compatible database engine built from scratch in Rust — entirely gene
 
 This project is a demonstration of modern AI coding tools. Every line of code — the hand-written SQL tokenizer, recursive descent parser, B-tree storage engine, page cache, rollback journal, and query executor — was written by AI (Claude). cqlite exists to showcase what AI-assisted development can accomplish: a functional, file-compatible SQLite implementation built from first principles, without copying from the SQLite source code or using any existing SQL parsing libraries or database engines. The result is 17k lines of Rust that passes 38 integration tests across the full stack, from parsing to persistence.
 
+## Setup
+
+```
+./scripts/setup.sh
+```
+
+This configures git to use the repo's pre-commit hook, which enforces formatting (`cargo fmt`), linting (`cargo clippy`), and tests (`cargo test`) on every commit.
+
 ## Building
 
 ```

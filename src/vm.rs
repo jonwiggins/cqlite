@@ -263,6 +263,9 @@ pub fn execute_select(
         let mut raw_rows: Vec<(i64, Vec<Value>)> = Vec::new();
         if let Some(schema) = table_schema {
             raw_rows = scan_table(pager, schema)?;
+        } else {
+            // No FROM clause: produce a single synthetic row for expression evaluation.
+            raw_rows.push((0, vec![]));
         }
         let col_names: Vec<String> = table_schema
             .map(|s| s.columns.clone())
@@ -354,6 +357,24 @@ pub fn execute_select(
             .map(|(i, _)| result_rows[*i].clone())
             .collect();
         result_rows = sorted_rows;
+    }
+
+    // Apply DISTINCT.
+    if stmt.distinct {
+        let mut seen: Vec<Vec<Value>> = Vec::new();
+        result_rows.retain(|row| {
+            if seen.iter().any(|s| {
+                s.len() == row.values.len()
+                    && s.iter()
+                        .zip(row.values.iter())
+                        .all(|(a, b)| crate::types::sqlite_cmp(a, b) == std::cmp::Ordering::Equal)
+            }) {
+                false
+            } else {
+                seen.push(row.values.clone());
+                true
+            }
+        });
     }
 
     // Apply LIMIT and OFFSET.
@@ -1193,8 +1214,58 @@ pub fn eval_expr(
 
         Expr::Cast { expr, type_name } => {
             let val = eval_expr(expr, column_names, values, rowid, table_name)?;
-            let affinity = crate::types::determine_affinity(type_name);
-            Ok(crate::types::apply_affinity(val, affinity))
+            let upper_type = type_name.to_uppercase();
+            // CAST performs hard conversion, unlike column affinity.
+            if upper_type.contains("INT") {
+                match &val {
+                    Value::Null => Ok(Value::Null),
+                    Value::Integer(_) => Ok(val),
+                    Value::Real(f) => Ok(Value::Integer(*f as i64)),
+                    Value::Text(s) => {
+                        if let Ok(i) = s.parse::<i64>() {
+                            Ok(Value::Integer(i))
+                        } else if let Ok(f) = s.parse::<f64>() {
+                            Ok(Value::Integer(f as i64))
+                        } else {
+                            Ok(Value::Integer(0))
+                        }
+                    }
+                    Value::Blob(_) => Ok(Value::Integer(0)),
+                }
+            } else if upper_type.contains("REAL") || upper_type.contains("FLOA") || upper_type.contains("DOUB") {
+                match &val {
+                    Value::Null => Ok(Value::Null),
+                    Value::Real(_) => Ok(val),
+                    Value::Integer(n) => Ok(Value::Real(*n as f64)),
+                    Value::Text(s) => {
+                        if let Ok(f) = s.parse::<f64>() {
+                            Ok(Value::Real(f))
+                        } else {
+                            Ok(Value::Real(0.0))
+                        }
+                    }
+                    Value::Blob(_) => Ok(Value::Real(0.0)),
+                }
+            } else if upper_type.contains("TEXT") || upper_type.contains("CHAR") || upper_type.contains("CLOB") || upper_type.contains("VAR") {
+                match &val {
+                    Value::Null => Ok(Value::Null),
+                    Value::Text(_) => Ok(val),
+                    Value::Integer(n) => Ok(Value::Text(n.to_string())),
+                    Value::Real(f) => Ok(Value::Text(format!("{f}"))),
+                    Value::Blob(b) => Ok(Value::Text(String::from_utf8_lossy(b).to_string())),
+                }
+            } else if upper_type.contains("BLOB") {
+                match &val {
+                    Value::Null => Ok(Value::Null),
+                    Value::Blob(_) => Ok(val),
+                    Value::Text(s) => Ok(Value::Blob(s.as_bytes().to_vec())),
+                    _ => Ok(val), // SQLite preserves other types as-is for BLOB cast
+                }
+            } else {
+                // Unknown type: use affinity-based conversion.
+                let affinity = crate::types::determine_affinity(type_name);
+                Ok(crate::types::apply_affinity(val, affinity))
+            }
         }
 
         Expr::Case {
@@ -1517,6 +1588,305 @@ fn eval_function(
                 }
             }
             Ok(min.clone())
+        }
+        "SUBSTR" | "SUBSTRING" => {
+            if arg_values.len() < 2 || arg_values.len() > 3 {
+                return Err(RsqliteError::Runtime(
+                    "substr() takes 2 or 3 arguments".into(),
+                ));
+            }
+            if arg_values[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let s = arg_values[0].to_text().unwrap_or_default();
+            let chars: Vec<char> = s.chars().collect();
+            // SQLite substr is 1-based. Negative means from the end.
+            let start = match &arg_values[1] {
+                Value::Integer(n) => *n,
+                _ => return Ok(Value::Null),
+            };
+            let len = if arg_values.len() == 3 {
+                match &arg_values[2] {
+                    Value::Integer(n) => Some(*n),
+                    _ => return Ok(Value::Null),
+                }
+            } else {
+                None
+            };
+            // Convert to 0-based index.
+            let start_idx = if start > 0 {
+                (start - 1) as usize
+            } else if start < 0 {
+                let from_end = (-start) as usize;
+                if from_end > chars.len() {
+                    0
+                } else {
+                    chars.len() - from_end
+                }
+            } else {
+                // start == 0 is treated as start == 1 but the first char is skipped.
+                0
+            };
+            let result: String = if let Some(l) = len {
+                if l < 0 {
+                    String::new()
+                } else {
+                    let actual_start = if start == 0 {
+                        // When start=0, length is effectively reduced by 1.
+                        let take = (l as usize).saturating_sub(1);
+                        chars.iter().skip(start_idx).take(take).collect()
+                    } else {
+                        chars.iter().skip(start_idx).take(l as usize).collect()
+                    };
+                    actual_start
+                }
+            } else {
+                chars[start_idx.min(chars.len())..].iter().collect()
+            };
+            Ok(Value::Text(result))
+        }
+        "TRIM" => {
+            if arg_values.len() != 1 {
+                return Err(RsqliteError::Runtime("trim() takes 1 argument".into()));
+            }
+            match &arg_values[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => Ok(Value::Text(s.trim().to_string())),
+                other => Ok(Value::Text(other.to_text().unwrap_or_default().trim().to_string())),
+            }
+        }
+        "LTRIM" => {
+            if arg_values.len() != 1 {
+                return Err(RsqliteError::Runtime("ltrim() takes 1 argument".into()));
+            }
+            match &arg_values[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => Ok(Value::Text(s.trim_start().to_string())),
+                other => Ok(Value::Text(
+                    other.to_text().unwrap_or_default().trim_start().to_string(),
+                )),
+            }
+        }
+        "RTRIM" => {
+            if arg_values.len() != 1 {
+                return Err(RsqliteError::Runtime("rtrim() takes 1 argument".into()));
+            }
+            match &arg_values[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => Ok(Value::Text(s.trim_end().to_string())),
+                other => Ok(Value::Text(
+                    other.to_text().unwrap_or_default().trim_end().to_string(),
+                )),
+            }
+        }
+        "REPLACE" => {
+            if arg_values.len() != 3 {
+                return Err(RsqliteError::Runtime("replace() takes 3 arguments".into()));
+            }
+            if arg_values[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let s = arg_values[0].to_text().unwrap_or_default();
+            let from = arg_values[1].to_text().unwrap_or_default();
+            let to = arg_values[2].to_text().unwrap_or_default();
+            Ok(Value::Text(s.replace(&from, &to)))
+        }
+        "HEX" => {
+            if arg_values.len() != 1 {
+                return Err(RsqliteError::Runtime("hex() takes 1 argument".into()));
+            }
+            match &arg_values[0] {
+                Value::Null => Ok(Value::Text(String::new())),
+                Value::Blob(b) => {
+                    let hex: String = b.iter().map(|byte| format!("{byte:02X}")).collect();
+                    Ok(Value::Text(hex))
+                }
+                other => {
+                    let s = other.to_text().unwrap_or_default();
+                    let hex: String = s.bytes().map(|byte| format!("{byte:02X}")).collect();
+                    Ok(Value::Text(hex))
+                }
+            }
+        }
+        "QUOTE" => {
+            if arg_values.len() != 1 {
+                return Err(RsqliteError::Runtime("quote() takes 1 argument".into()));
+            }
+            match &arg_values[0] {
+                Value::Null => Ok(Value::Text("NULL".to_string())),
+                Value::Integer(n) => Ok(Value::Text(n.to_string())),
+                Value::Real(f) => Ok(Value::Text(format!("{f}"))),
+                Value::Text(s) => {
+                    let escaped = s.replace('\'', "''");
+                    Ok(Value::Text(format!("'{escaped}'")))
+                }
+                Value::Blob(b) => {
+                    let hex: String = b.iter().map(|byte| format!("{byte:02X}")).collect();
+                    Ok(Value::Text(format!("X'{hex}'")))
+                }
+            }
+        }
+        "RANDOM" => {
+            // Return a random integer between i64::MIN and i64::MAX.
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                .hash(&mut hasher);
+            Ok(Value::Integer(hasher.finish() as i64))
+        }
+        "INSTR" => {
+            if arg_values.len() != 2 {
+                return Err(RsqliteError::Runtime("instr() takes 2 arguments".into()));
+            }
+            if arg_values[0].is_null() || arg_values[1].is_null() {
+                return Ok(Value::Null);
+            }
+            let haystack = arg_values[0].to_text().unwrap_or_default();
+            let needle = arg_values[1].to_text().unwrap_or_default();
+            match haystack.find(&needle) {
+                Some(pos) => {
+                    // SQLite returns 1-based position (counting characters).
+                    let char_pos = haystack[..pos].chars().count() + 1;
+                    Ok(Value::Integer(char_pos as i64))
+                }
+                None => Ok(Value::Integer(0)),
+            }
+        }
+        "UNICODE" => {
+            if arg_values.len() != 1 {
+                return Err(RsqliteError::Runtime("unicode() takes 1 argument".into()));
+            }
+            match &arg_values[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => {
+                    if let Some(c) = s.chars().next() {
+                        Ok(Value::Integer(c as i64))
+                    } else {
+                        Ok(Value::Null)
+                    }
+                }
+                _ => Ok(Value::Null),
+            }
+        }
+        "ZEROBLOB" => {
+            if arg_values.len() != 1 {
+                return Err(RsqliteError::Runtime("zeroblob() takes 1 argument".into()));
+            }
+            match &arg_values[0] {
+                Value::Integer(n) => {
+                    let size = (*n).max(0) as usize;
+                    Ok(Value::Blob(vec![0u8; size]))
+                }
+                _ => Ok(Value::Blob(vec![])),
+            }
+        }
+        "ROUND" => {
+            if arg_values.is_empty() || arg_values.len() > 2 {
+                return Err(RsqliteError::Runtime(
+                    "round() takes 1 or 2 arguments".into(),
+                ));
+            }
+            if arg_values[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let val = match &arg_values[0] {
+                Value::Integer(n) => *n as f64,
+                Value::Real(f) => *f,
+                _ => return Ok(Value::Real(0.0)),
+            };
+            let decimals = if arg_values.len() == 2 {
+                match &arg_values[1] {
+                    Value::Integer(n) => *n as i32,
+                    _ => 0,
+                }
+            } else {
+                0
+            };
+            let factor = 10f64.powi(decimals);
+            Ok(Value::Real((val * factor).round() / factor))
+        }
+        "CHAR" => {
+            // char(X1,X2,...) returns a string from Unicode code points.
+            let s: String = arg_values
+                .iter()
+                .filter_map(|v| match v {
+                    Value::Integer(n) => char::from_u32(*n as u32),
+                    _ => None,
+                })
+                .collect();
+            Ok(Value::Text(s))
+        }
+        "PRINTF" | "FORMAT" => {
+            // Simplified printf: just handle %d, %s, %f, %%.
+            if arg_values.is_empty() {
+                return Err(RsqliteError::Runtime(
+                    "printf() requires at least 1 argument".into(),
+                ));
+            }
+            let fmt = arg_values[0].to_text().unwrap_or_default();
+            let mut result = String::new();
+            let mut arg_idx = 1;
+            let chars: Vec<char> = fmt.chars().collect();
+            let mut i = 0;
+            while i < chars.len() {
+                if chars[i] == '%' && i + 1 < chars.len() {
+                    match chars[i + 1] {
+                        'd' | 'i' => {
+                            if arg_idx < arg_values.len() {
+                                match &arg_values[arg_idx] {
+                                    Value::Integer(n) => result.push_str(&n.to_string()),
+                                    Value::Real(f) => result.push_str(&(*f as i64).to_string()),
+                                    _ => result.push('0'),
+                                }
+                                arg_idx += 1;
+                            }
+                            i += 2;
+                        }
+                        'f' => {
+                            if arg_idx < arg_values.len() {
+                                match &arg_values[arg_idx] {
+                                    Value::Real(f) => result.push_str(&format!("{f:.6}")),
+                                    Value::Integer(n) => {
+                                        result.push_str(&format!("{:.6}", *n as f64))
+                                    }
+                                    _ => result.push_str("0.000000"),
+                                }
+                                arg_idx += 1;
+                            }
+                            i += 2;
+                        }
+                        's' => {
+                            if arg_idx < arg_values.len() {
+                                result.push_str(
+                                    &arg_values[arg_idx].to_text().unwrap_or_default(),
+                                );
+                                arg_idx += 1;
+                            }
+                            i += 2;
+                        }
+                        '%' => {
+                            result.push('%');
+                            i += 2;
+                        }
+                        _ => {
+                            result.push('%');
+                            i += 1;
+                        }
+                    }
+                } else {
+                    result.push(chars[i]);
+                    i += 1;
+                }
+            }
+            Ok(Value::Text(result))
+        }
+        "TOTAL_CHANGES" | "CHANGES" | "LAST_INSERT_ROWID" => {
+            // Stub: return 0 for now.
+            Ok(Value::Integer(0))
         }
         _ => Err(RsqliteError::Runtime(format!(
             "no such function: {name}"

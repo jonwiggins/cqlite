@@ -1789,4 +1789,165 @@ mod tests {
         // Boss has no manager (NULL), so only Alice and Bob appear.
         assert_eq!(result.rows.len(), 2);
     }
+
+    // -- Scalar function tests --
+
+    #[test]
+    fn test_scalar_functions_basic() {
+        let mut db = Database::in_memory();
+
+        // substr
+        let r = db.execute("SELECT substr('hello world', 7)").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Text("world".into()));
+
+        let r = db.execute("SELECT substr('hello', 2, 3)").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Text("ell".into()));
+
+        // negative start (from end)
+        let r = db.execute("SELECT substr('hello', -3)").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Text("llo".into()));
+
+        // trim
+        let r = db.execute("SELECT trim('  hello  ')").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Text("hello".into()));
+
+        let r = db.execute("SELECT ltrim('  hello  ')").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Text("hello  ".into()));
+
+        let r = db.execute("SELECT rtrim('  hello  ')").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Text("  hello".into()));
+
+        // replace
+        let r = db
+            .execute("SELECT replace('hello world', 'world', 'rust')")
+            .unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Text("hello rust".into()));
+
+        // instr
+        let r = db.execute("SELECT instr('hello world', 'world')").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Integer(7));
+
+        let r = db.execute("SELECT instr('hello', 'xyz')").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Integer(0));
+    }
+
+    #[test]
+    fn test_scalar_functions_hex_quote_round() {
+        let mut db = Database::in_memory();
+
+        // hex
+        let r = db.execute("SELECT hex('ABC')").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Text("414243".into()));
+
+        // quote
+        let r = db.execute("SELECT quote('hello')").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Text("'hello'".into()));
+
+        let r = db.execute("SELECT quote(NULL)").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Text("NULL".into()));
+
+        let r = db.execute("SELECT quote(42)").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Text("42".into()));
+
+        // round
+        let r = db.execute("SELECT round(3.14159, 2)").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Real(3.14));
+
+        let r = db.execute("SELECT round(3.5)").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Real(4.0));
+
+        // unicode
+        let r = db.execute("SELECT unicode('A')").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Integer(65));
+
+        // char
+        let r = db.execute("SELECT char(65, 66, 67)").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Text("ABC".into()));
+    }
+
+    #[test]
+    fn test_scalar_functions_with_table_data() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (name TEXT, val INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES ('Hello World', 42)").unwrap();
+        db.execute("INSERT INTO t VALUES ('  spaces  ', -7)").unwrap();
+
+        let r = db
+            .execute("SELECT upper(name), abs(val) FROM t ORDER BY rowid")
+            .unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Text("HELLO WORLD".into()));
+        assert_eq!(r.rows[0].values[1], Value::Integer(42));
+        assert_eq!(r.rows[1].values[0], Value::Text("  SPACES  ".into()));
+        assert_eq!(r.rows[1].values[1], Value::Integer(7));
+
+        let r = db
+            .execute("SELECT substr(name, 1, 5), trim(name) FROM t ORDER BY rowid")
+            .unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Text("Hello".into()));
+        assert_eq!(r.rows[1].values[1], Value::Text("spaces".into()));
+
+        let r = db
+            .execute("SELECT replace(name, ' ', '_') FROM t ORDER BY rowid")
+            .unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Text("Hello_World".into()));
+    }
+
+    #[test]
+    fn test_printf() {
+        let mut db = Database::in_memory();
+        let r = db
+            .execute("SELECT printf('Hello %s, you are %d', 'World', 42)")
+            .unwrap();
+        assert_eq!(
+            r.rows[0].values[0],
+            Value::Text("Hello World, you are 42".into())
+        );
+    }
+
+    // -- DISTINCT test --
+
+    #[test]
+    fn test_select_distinct() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (category TEXT, value INTEGER)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES ('a', 1)").unwrap();
+        db.execute("INSERT INTO t VALUES ('b', 2)").unwrap();
+        db.execute("INSERT INTO t VALUES ('a', 1)").unwrap();
+        db.execute("INSERT INTO t VALUES ('b', 3)").unwrap();
+        db.execute("INSERT INTO t VALUES ('a', 1)").unwrap();
+
+        // DISTINCT should remove duplicates.
+        let r = db
+            .execute("SELECT DISTINCT category, value FROM t ORDER BY category, value")
+            .unwrap();
+        assert_eq!(r.rows.len(), 3); // (a,1), (b,2), (b,3)
+
+        // DISTINCT on single column.
+        let r = db
+            .execute("SELECT DISTINCT category FROM t ORDER BY category")
+            .unwrap();
+        assert_eq!(r.rows.len(), 2); // a, b
+        assert_eq!(r.rows[0].values[0], Value::Text("a".into()));
+        assert_eq!(r.rows[1].values[0], Value::Text("b".into()));
+    }
+
+    // -- CAST test --
+
+    #[test]
+    fn test_cast_expressions() {
+        let mut db = Database::in_memory();
+
+        let r = db.execute("SELECT CAST('42' AS INTEGER)").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Integer(42));
+
+        let r = db.execute("SELECT CAST(42 AS TEXT)").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Text("42".into()));
+
+        let r = db.execute("SELECT CAST(3.14 AS INTEGER)").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Integer(3));
+
+        let r = db.execute("SELECT CAST('3.14' AS REAL)").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Real(3.14));
+    }
 }

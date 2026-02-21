@@ -1434,8 +1434,31 @@ impl<'a> Parser<'a> {
                     Ok(Expr::Parenthesized(Box::new(expr)))
                 }
             }
-            // Identifier (column ref or function call)
-            Token::Ident(_) => {
+            // Identifier or keyword-as-identifier (column ref or function call)
+            Token::Ident(_)
+            | Token::Replace
+            | Token::Abort
+            | Token::Conflict
+            | Token::Fail
+            | Token::Ignore
+            | Token::Table
+            | Token::Index
+            | Token::Key
+            | Token::Column
+            | Token::IntegerKw
+            | Token::RealKw
+            | Token::TextKw
+            | Token::BlobKw
+            | Token::NumericKw
+            | Token::Plan
+            | Token::Query
+            | Token::Rename
+            | Token::Savepoint
+            | Token::Transaction
+            | Token::Release
+            | Token::Recursive
+            | Token::Right
+            | Token::Outer => {
                 let name = self.parse_identifier()?;
 
                 // Check for function call: name(...)

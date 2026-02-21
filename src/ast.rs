@@ -7,7 +7,7 @@
 /// A complete SQL statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
-    Select(SelectStatement),
+    Select(Box<SelectStatement>),
     Insert(InsertStatement),
     Update(UpdateStatement),
     Delete(DeleteStatement),
@@ -44,6 +44,22 @@ pub struct SelectStatement {
     pub having: Option<Expr>,
     pub order_by: Option<Vec<OrderByItem>>,
     pub limit: Option<LimitClause>,
+    /// Compound operations (UNION, UNION ALL, INTERSECT, EXCEPT).
+    pub compound: Vec<CompoundClause>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompoundClause {
+    pub op: CompoundOp,
+    pub select: SelectStatement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompoundOp {
+    Union,
+    UnionAll,
+    Intersect,
+    Except,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -65,10 +81,7 @@ pub struct FromClause {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TableRef {
     /// A simple table name, optionally aliased.
-    Table {
-        name: String,
-        alias: Option<String>,
-    },
+    Table { name: String, alias: Option<String> },
     /// A subquery in the FROM clause.
     Subquery {
         select: Box<SelectStatement>,
@@ -276,10 +289,7 @@ pub enum Expr {
     /// A bind parameter: `?` or `?NNN`
     BindParameter(Option<u32>),
     /// A unary operation: `-expr`, `NOT expr`, `~expr`
-    UnaryOp {
-        op: UnaryOp,
-        operand: Box<Expr>,
-    },
+    UnaryOp { op: UnaryOp, operand: Box<Expr> },
     /// A binary operation: `a + b`, `a AND b`, etc.
     BinaryOp {
         left: Box<Expr>,
@@ -287,10 +297,7 @@ pub enum Expr {
         right: Box<Expr>,
     },
     /// `expr IS NULL` or `expr IS NOT NULL`
-    IsNull {
-        operand: Box<Expr>,
-        negated: bool,
-    },
+    IsNull { operand: Box<Expr>, negated: bool },
     /// `expr BETWEEN low AND high`
     Between {
         operand: Box<Expr>,
@@ -318,15 +325,9 @@ pub enum Expr {
         else_clause: Option<Box<Expr>>,
     },
     /// `CAST(expr AS type_name)`
-    Cast {
-        expr: Box<Expr>,
-        type_name: String,
-    },
+    Cast { expr: Box<Expr>, type_name: String },
     /// A function call: `func(args...)`
-    FunctionCall {
-        name: String,
-        args: FunctionArgs,
-    },
+    FunctionCall { name: String, args: FunctionArgs },
     /// A parenthesized expression.
     Parenthesized(Box<Expr>),
     /// A subquery expression: `(SELECT ...)`
@@ -337,10 +338,7 @@ pub enum Expr {
         negated: bool,
     },
     /// `expr COLLATE collation_name`
-    Collate {
-        expr: Box<Expr>,
-        collation: String,
-    },
+    Collate { expr: Box<Expr>, collation: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -400,10 +398,7 @@ pub enum FunctionArgs {
     /// `func(*)` (e.g., COUNT(*))
     Wildcard,
     /// `func(expr, ...)` or `func(DISTINCT expr, ...)`
-    Exprs {
-        distinct: bool,
-        args: Vec<Expr>,
-    },
+    Exprs { distinct: bool, args: Vec<Expr> },
 }
 
 #[cfg(test)]
@@ -436,6 +431,7 @@ mod tests {
             having: None,
             order_by: None,
             limit: None,
+            compound: vec![],
         };
         assert!(!stmt.distinct);
         assert_eq!(stmt.columns.len(), 1);

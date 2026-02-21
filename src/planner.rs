@@ -8,7 +8,7 @@
 //
 // Column names are extracted from CREATE TABLE SQL in the schema entries.
 
-use crate::ast::{Expr, InsertSource, LiteralValue, Statement};
+use crate::ast::{Expr, FunctionArgs, InsertSource, LiteralValue, Statement};
 use crate::btree;
 use crate::error::{Result, RsqliteError};
 use crate::pager::Pager;
@@ -67,6 +67,7 @@ impl Database {
             Statement::DropTable(drop) => self.execute_write(|db| db.execute_drop_table(drop)),
             Statement::CreateIndex(ci) => self.execute_write(|db| db.execute_create_index(ci)),
             Statement::DropIndex(di) => self.execute_write(|db| db.execute_drop_index(di)),
+            Statement::AlterTable(alter) => self.execute_write(|db| db.execute_alter_table(alter)),
             Statement::Explain(inner) => {
                 let description = format!("{inner:?}");
                 Ok(QueryResult {
@@ -207,24 +208,18 @@ impl Database {
     }
 
     /// Execute an INSERT statement.
-    fn execute_insert(
-        &mut self,
-        insert: &crate::ast::InsertStatement,
-    ) -> Result<QueryResult> {
+    fn execute_insert(&mut self, insert: &crate::ast::InsertStatement) -> Result<QueryResult> {
         // Look up the table schema.
         let schema_entries = schema::read_schema(&mut self.pager)?;
         let table_schemas = build_table_schemas(&schema_entries)?;
         let schema = table_schemas
             .iter()
             .find(|t| t.name.eq_ignore_ascii_case(&insert.table))
-            .ok_or_else(|| {
-                RsqliteError::Runtime(format!("no such table: {}", insert.table))
-            })?
+            .ok_or_else(|| RsqliteError::Runtime(format!("no such table: {}", insert.table)))?
             .clone();
 
         // Find indexes on this table.
-        let mut indexes =
-            build_index_schemas(&schema_entries, &schema.name, &schema.columns);
+        let mut indexes = build_index_schemas(&schema_entries, &schema.name, &schema.columns);
 
         let rows = match &insert.source {
             InsertSource::Values(row_list) => {
@@ -240,10 +235,9 @@ impl Database {
                 let values: Vec<Value> = schema.columns.iter().map(|_| Value::Null).collect();
                 vec![values]
             }
-            InsertSource::Select(_) => {
-                return Err(RsqliteError::NotImplemented(
-                    "INSERT ... SELECT".into(),
-                ));
+            InsertSource::Select(select) => {
+                let result = vm::execute_select(&mut self.pager, select, &table_schemas)?;
+                result.rows.into_iter().map(|row| row.values).collect()
             }
         };
 
@@ -276,6 +270,17 @@ impl Database {
             // Pad or truncate to match column count.
             values.resize(schema.columns.len(), Value::Null);
 
+            // Apply DEFAULT values for NULL columns and enforce NOT NULL.
+            for (i, val) in values.iter_mut().enumerate() {
+                if let Some(cc) = schema.column_constraints.get(i) {
+                    if matches!(val, Value::Null) {
+                        if let Some(ref default_val) = cc.default_value {
+                            *val = default_val.clone();
+                        }
+                    }
+                }
+            }
+
             // Determine rowid.
             let rowid = if let Some(pk_idx) = schema.rowid_column {
                 match &values[pk_idx] {
@@ -288,9 +293,9 @@ impl Database {
                     }
                     Value::Null => {
                         // Auto-assign rowid.
-                        let id = btree::find_max_rowid(&mut self.pager, root_page)? + 1;
+
                         // Keep NULL in the record.
-                        id
+                        btree::find_max_rowid(&mut self.pager, root_page)? + 1
                     }
                     _ => {
                         // Try to convert to integer.
@@ -302,6 +307,21 @@ impl Database {
             } else {
                 btree::find_max_rowid(&mut self.pager, root_page)? + 1
             };
+
+            // Enforce NOT NULL constraints (skip the IPK column which stores NULL in record).
+            for (i, val) in values.iter().enumerate() {
+                if schema.rowid_column == Some(i) {
+                    continue; // IPK stores NULL in record, actual value is rowid.
+                }
+                if let Some(cc) = schema.column_constraints.get(i) {
+                    if cc.not_null && matches!(val, Value::Null) {
+                        return Err(RsqliteError::Constraint(format!(
+                            "NOT NULL constraint failed: {}.{}",
+                            schema.name, schema.columns[i]
+                        )));
+                    }
+                }
+            }
 
             let payload = record::encode_record(&values);
             let new_root = btree::btree_insert(&mut self.pager, root_page, rowid, &payload)?;
@@ -337,18 +357,13 @@ impl Database {
     }
 
     /// Execute a DELETE statement.
-    fn execute_delete(
-        &mut self,
-        delete: &crate::ast::DeleteStatement,
-    ) -> Result<QueryResult> {
+    fn execute_delete(&mut self, delete: &crate::ast::DeleteStatement) -> Result<QueryResult> {
         let schema_entries = schema::read_schema(&mut self.pager)?;
         let table_schemas = build_table_schemas(&schema_entries)?;
         let schema = table_schemas
             .iter()
             .find(|t| t.name.eq_ignore_ascii_case(&delete.table))
-            .ok_or_else(|| {
-                RsqliteError::Runtime(format!("no such table: {}", delete.table))
-            })?
+            .ok_or_else(|| RsqliteError::Runtime(format!("no such table: {}", delete.table)))?
             .clone();
 
         // Find indexes on this table.
@@ -406,18 +421,13 @@ impl Database {
     }
 
     /// Execute an UPDATE statement.
-    fn execute_update(
-        &mut self,
-        update: &crate::ast::UpdateStatement,
-    ) -> Result<QueryResult> {
+    fn execute_update(&mut self, update: &crate::ast::UpdateStatement) -> Result<QueryResult> {
         let schema_entries = schema::read_schema(&mut self.pager)?;
         let table_schemas = build_table_schemas(&schema_entries)?;
         let schema = table_schemas
             .iter()
             .find(|t| t.name.eq_ignore_ascii_case(&update.table))
-            .ok_or_else(|| {
-                RsqliteError::Runtime(format!("no such table: {}", update.table))
-            })?
+            .ok_or_else(|| RsqliteError::Runtime(format!("no such table: {}", update.table)))?
             .clone();
 
         // Find indexes on this table.
@@ -465,6 +475,20 @@ impl Database {
                             table_name,
                         )?;
                         values[col_idx] = new_val;
+                    }
+                }
+                // Enforce NOT NULL constraints on updated values.
+                for (i, val) in values.iter().enumerate() {
+                    if schema.rowid_column == Some(i) {
+                        continue;
+                    }
+                    if let Some(cc) = schema.column_constraints.get(i) {
+                        if cc.not_null && matches!(val, Value::Null) {
+                            return Err(RsqliteError::Constraint(format!(
+                                "NOT NULL constraint failed: {}.{}",
+                                schema.name, schema.columns[i]
+                            )));
+                        }
                     }
                 }
                 updates.push((rowid, values));
@@ -522,10 +546,7 @@ impl Database {
     }
 
     /// Execute a DROP TABLE statement.
-    fn execute_drop_table(
-        &mut self,
-        drop: &crate::ast::DropTableStatement,
-    ) -> Result<QueryResult> {
+    fn execute_drop_table(&mut self, drop: &crate::ast::DropTableStatement) -> Result<QueryResult> {
         let schema_entries = schema::read_schema(&mut self.pager)?;
 
         if schema::find_table(&schema_entries, &drop.name).is_none() {
@@ -694,10 +715,7 @@ impl Database {
     }
 
     /// Execute a DROP INDEX statement.
-    fn execute_drop_index(
-        &mut self,
-        drop: &crate::ast::DropIndexStatement,
-    ) -> Result<QueryResult> {
+    fn execute_drop_index(&mut self, drop: &crate::ast::DropIndexStatement) -> Result<QueryResult> {
         let schema_entries = schema::read_schema(&mut self.pager)?;
 
         let found = schema_entries
@@ -746,6 +764,220 @@ impl Database {
         Ok(empty_result())
     }
 
+    /// Execute an ALTER TABLE statement.
+    fn execute_alter_table(
+        &mut self,
+        alter: &crate::ast::AlterTableStatement,
+    ) -> Result<QueryResult> {
+        use crate::ast::AlterTableAction;
+
+        let schema_entries = schema::read_schema(&mut self.pager)?;
+        let entry = schema::find_table(&schema_entries, &alter.table)
+            .ok_or_else(|| RsqliteError::Runtime(format!("no such table: {}", alter.table)))?
+            .clone();
+
+        match &alter.action {
+            AlterTableAction::RenameTable(new_name) => {
+                // Check that the new name doesn't already exist.
+                if schema::find_table(&schema_entries, new_name).is_some() {
+                    return Err(RsqliteError::Runtime(format!(
+                        "there is already another table or index with this name: {new_name}"
+                    )));
+                }
+
+                // Update the SQL in sqlite_master: replace the old table name.
+                let new_sql = if let Some(ref sql) = entry.sql {
+                    // Replace table name in the CREATE TABLE statement.
+                    // Parse and reconstruct to be safe.
+                    if let Ok(Statement::CreateTable(mut ct)) = crate::parser::parse(sql) {
+                        ct.name = new_name.clone();
+                        reconstruct_create_table_sql(&ct)
+                    } else {
+                        sql.replace(&alter.table, new_name)
+                    }
+                } else {
+                    return Err(RsqliteError::Runtime("table has no SQL definition".into()));
+                };
+
+                // Update sqlite_master entry.
+                self.update_schema_entry(&entry.name, &entry.entry_type, |values| {
+                    values[1] = Value::Text(new_name.clone()); // name
+                    values[2] = Value::Text(new_name.clone()); // tbl_name
+                    values[4] = Value::Text(new_sql.clone()); // sql
+                })?;
+
+                // Also update any indexes that reference this table.
+                for idx_entry in &schema_entries {
+                    if idx_entry.entry_type == "index"
+                        && idx_entry.tbl_name.eq_ignore_ascii_case(&alter.table)
+                    {
+                        let new_idx_sql = idx_entry
+                            .sql
+                            .as_ref()
+                            .map(|s| s.replace(&alter.table, new_name));
+                        self.update_schema_entry(&idx_entry.name, "index", |values| {
+                            values[2] = Value::Text(new_name.clone()); // tbl_name
+                            if let Some(ref sql) = new_idx_sql {
+                                values[4] = Value::Text(sql.clone()); // sql
+                            }
+                        })?;
+                    }
+                }
+            }
+
+            AlterTableAction::AddColumn(col_def) => {
+                // Modify the CREATE TABLE SQL to add the new column.
+                let new_sql = if let Some(ref sql) = entry.sql {
+                    if let Ok(Statement::CreateTable(mut ct)) = crate::parser::parse(sql) {
+                        ct.columns.push(col_def.clone());
+                        reconstruct_create_table_sql(&ct)
+                    } else {
+                        return Err(RsqliteError::Runtime(
+                            "could not parse table definition".into(),
+                        ));
+                    }
+                } else {
+                    return Err(RsqliteError::Runtime("table has no SQL definition".into()));
+                };
+
+                self.update_schema_entry(&entry.name, &entry.entry_type, |values| {
+                    values[4] = Value::Text(new_sql.clone());
+                })?;
+
+                // Note: existing rows will naturally return NULL for the new column
+                // since they have fewer values than the new column count.
+            }
+
+            AlterTableAction::RenameColumn { old, new } => {
+                let new_sql = if let Some(ref sql) = entry.sql {
+                    if let Ok(Statement::CreateTable(mut ct)) = crate::parser::parse(sql) {
+                        let found = ct
+                            .columns
+                            .iter_mut()
+                            .find(|c| c.name.eq_ignore_ascii_case(old));
+                        if let Some(col) = found {
+                            col.name = new.clone();
+                        } else {
+                            return Err(RsqliteError::Runtime(format!("no such column: {old}")));
+                        }
+                        reconstruct_create_table_sql(&ct)
+                    } else {
+                        return Err(RsqliteError::Runtime(
+                            "could not parse table definition".into(),
+                        ));
+                    }
+                } else {
+                    return Err(RsqliteError::Runtime("table has no SQL definition".into()));
+                };
+
+                self.update_schema_entry(&entry.name, &entry.entry_type, |values| {
+                    values[4] = Value::Text(new_sql.clone());
+                })?;
+            }
+
+            AlterTableAction::DropColumn(col_name) => {
+                // SQLite's DROP COLUMN has restrictions. We implement a simple version
+                // that just removes the column from the schema.
+                let (new_sql, col_idx) = if let Some(ref sql) = entry.sql {
+                    if let Ok(Statement::CreateTable(mut ct)) = crate::parser::parse(sql) {
+                        let idx = ct
+                            .columns
+                            .iter()
+                            .position(|c| c.name.eq_ignore_ascii_case(col_name));
+                        if let Some(idx) = idx {
+                            ct.columns.remove(idx);
+                            (reconstruct_create_table_sql(&ct), idx)
+                        } else {
+                            return Err(RsqliteError::Runtime(format!(
+                                "no such column: {col_name}"
+                            )));
+                        }
+                    } else {
+                        return Err(RsqliteError::Runtime(
+                            "could not parse table definition".into(),
+                        ));
+                    }
+                } else {
+                    return Err(RsqliteError::Runtime("table has no SQL definition".into()));
+                };
+
+                // Rewrite all rows to remove the column data.
+                let table_schemas = build_table_schemas(&schema_entries)?;
+                let schema = table_schemas
+                    .iter()
+                    .find(|t| t.name.eq_ignore_ascii_case(&alter.table))
+                    .ok_or_else(|| {
+                        RsqliteError::Runtime(format!("no such table: {}", alter.table))
+                    })?
+                    .clone();
+
+                let mut rows_to_rewrite: Vec<(i64, Vec<Value>)> = Vec::new();
+                let mut cursor = btree::BTreeCursor::new(schema.root_page);
+                cursor.move_to_first(&mut self.pager)?;
+                while cursor.is_valid() {
+                    let rowid = cursor.current_rowid(&mut self.pager)?;
+                    let payload = cursor.current_payload(&mut self.pager)?;
+                    let mut values = record::decode_record(&payload)?;
+                    if col_idx < values.len() {
+                        values.remove(col_idx);
+                    }
+                    rows_to_rewrite.push((rowid, values));
+                    cursor.move_to_next(&mut self.pager)?;
+                }
+
+                // Delete and re-insert all rows.
+                for (rowid, _) in &rows_to_rewrite {
+                    btree::btree_delete(&mut self.pager, schema.root_page, *rowid)?;
+                }
+                for (rowid, values) in rows_to_rewrite {
+                    let payload = record::encode_record(&values);
+                    btree::btree_insert(&mut self.pager, schema.root_page, rowid, &payload)?;
+                }
+
+                self.update_schema_entry(&entry.name, &entry.entry_type, |values| {
+                    values[4] = Value::Text(new_sql.clone());
+                })?;
+            }
+        }
+
+        self.pager.header.schema_cookie += 1;
+        self.pager.flush()?;
+        Ok(empty_result())
+    }
+
+    /// Helper: update a single sqlite_master entry by name and type.
+    fn update_schema_entry<F>(&mut self, name: &str, entry_type: &str, update_fn: F) -> Result<()>
+    where
+        F: FnOnce(&mut Vec<Value>),
+    {
+        let mut cursor = btree::BTreeCursor::new(1);
+        cursor.move_to_first(&mut self.pager)?;
+
+        while cursor.is_valid() {
+            let rowid = cursor.current_rowid(&mut self.pager)?;
+            let payload = cursor.current_payload(&mut self.pager)?;
+            let mut values = record::decode_record(&payload)?;
+
+            if values.len() >= 5 {
+                let matches = match (&values[0], &values[1]) {
+                    (Value::Text(et), Value::Text(n)) => {
+                        et.eq_ignore_ascii_case(entry_type) && n.eq_ignore_ascii_case(name)
+                    }
+                    _ => false,
+                };
+                if matches {
+                    update_fn(&mut values);
+                    let new_payload = record::encode_record(&values);
+                    btree::btree_delete(&mut self.pager, 1, rowid)?;
+                    btree::btree_insert(&mut self.pager, 1, rowid, &new_payload)?;
+                    return Ok(());
+                }
+            }
+            cursor.move_to_next(&mut self.pager)?;
+        }
+        Ok(())
+    }
+
     /// Read the database schema (all entries from sqlite_master).
     pub fn schema(&mut self) -> Result<Vec<SchemaEntry>> {
         schema::read_schema(&mut self.pager)
@@ -772,17 +1004,22 @@ fn build_table_schemas(entries: &[SchemaEntry]) -> Result<Vec<TableSchema>> {
             continue;
         }
 
-        let (columns, rowid_column) = if let Some(ref sql) = entry.sql {
+        let info = if let Some(ref sql) = entry.sql {
             extract_table_info(sql)
         } else {
-            (vec![], None)
+            FullTableInfo {
+                columns: vec![],
+                rowid_column: None,
+                constraints: vec![],
+            }
         };
 
         schemas.push(TableSchema {
             name: entry.name.clone(),
-            columns,
+            columns: info.columns,
             root_page: entry.rootpage as u32,
-            rowid_column,
+            rowid_column: info.rowid_column,
+            column_constraints: info.constraints,
         });
     }
 
@@ -824,27 +1061,25 @@ fn build_index_schemas(
         };
 
         // Parse the CREATE INDEX SQL to get column names.
-        if let Ok(stmt) = crate::parser::parse(sql) {
-            if let Statement::CreateIndex(ci) = stmt {
-                let col_indices: Vec<usize> = ci
-                    .columns
-                    .iter()
-                    .filter_map(|ic| {
-                        table_columns
-                            .iter()
-                            .position(|c| c.eq_ignore_ascii_case(&ic.name))
-                    })
-                    .collect();
+        if let Ok(Statement::CreateIndex(ci)) = crate::parser::parse(sql) {
+            let col_indices: Vec<usize> = ci
+                .columns
+                .iter()
+                .filter_map(|ic| {
+                    table_columns
+                        .iter()
+                        .position(|c| c.eq_ignore_ascii_case(&ic.name))
+                })
+                .collect();
 
-                if col_indices.len() == ci.columns.len() {
-                    indexes.push(IndexSchema {
-                        name: entry.name.clone(),
-                        table_name: entry.tbl_name.clone(),
-                        root_page: entry.rootpage as u32,
-                        column_indices: col_indices,
-                        unique: ci.unique,
-                    });
-                }
+            if col_indices.len() == ci.columns.len() {
+                indexes.push(IndexSchema {
+                    name: entry.name.clone(),
+                    table_name: entry.tbl_name.clone(),
+                    root_page: entry.rootpage as u32,
+                    column_indices: col_indices,
+                    unique: ci.unique,
+                });
             }
         }
     }
@@ -869,8 +1104,7 @@ fn insert_into_indexes(
 
         let index_payload = record::encode_record(&index_values);
         let idx_rowid = btree::find_max_rowid(pager, index.root_page)? + 1;
-        let new_root =
-            btree::btree_insert(pager, index.root_page, idx_rowid, &index_payload)?;
+        let new_root = btree::btree_insert(pager, index.root_page, idx_rowid, &index_payload)?;
         if new_root != index.root_page {
             update_root_page(pager, &index.name, new_root)?;
             index.root_page = new_root;
@@ -880,11 +1114,7 @@ fn insert_into_indexes(
 }
 
 /// Delete a row from all indexes for a table by scanning for the matching table rowid.
-fn delete_from_indexes(
-    pager: &mut Pager,
-    indexes: &[IndexSchema],
-    table_rowid: i64,
-) -> Result<()> {
+fn delete_from_indexes(pager: &mut Pager, indexes: &[IndexSchema], table_rowid: i64) -> Result<()> {
     for index in indexes {
         // Scan the index to find the entry with this table rowid.
         let mut cursor = btree::BTreeCursor::new(index.root_page);
@@ -910,38 +1140,80 @@ fn delete_from_indexes(
     Ok(())
 }
 
-/// Extract column names and INTEGER PRIMARY KEY index from a CREATE TABLE SQL.
-///
-/// Returns (column_names, rowid_column_index).
-/// rowid_column_index is Some(i) if column i is declared as INTEGER PRIMARY KEY.
-fn extract_table_info(sql: &str) -> (Vec<String>, Option<usize>) {
+/// Full table info extracted from CREATE TABLE SQL.
+struct FullTableInfo {
+    columns: Vec<String>,
+    rowid_column: Option<usize>,
+    constraints: Vec<vm::ColumnConstraints>,
+}
+
+/// Extract column names, INTEGER PRIMARY KEY index, and constraints from a CREATE TABLE SQL.
+fn extract_table_info(sql: &str) -> FullTableInfo {
     // Try the parser first.
-    if let Ok(stmt) = crate::parser::parse(sql) {
-        if let Statement::CreateTable(ct) = stmt {
-            let columns: Vec<String> = ct.columns.iter().map(|c| c.name.clone()).collect();
-            let rowid_col = find_integer_primary_key(&ct);
-            return (columns, rowid_col);
-        }
+    if let Ok(Statement::CreateTable(ct)) = crate::parser::parse(sql) {
+        let columns: Vec<String> = ct.columns.iter().map(|c| c.name.clone()).collect();
+        let rowid_col = find_integer_primary_key(&ct);
+        let constraints = extract_constraints(&ct, rowid_col);
+        return FullTableInfo {
+            columns,
+            rowid_column: rowid_col,
+            constraints,
+        };
     }
 
     // Fallback: simple text-based extraction.
     let columns = extract_column_names_text(sql);
-    // In text fallback, also try to detect INTEGER PRIMARY KEY.
     let rowid_col = detect_integer_pk_text(sql, &columns);
-    (columns, rowid_col)
+    let constraints = vec![vm::ColumnConstraints::default(); columns.len()];
+    FullTableInfo {
+        columns,
+        rowid_column: rowid_col,
+        constraints,
+    }
 }
 
-/// Extract column names from a CREATE TABLE SQL statement (text-based fallback).
-fn extract_column_names(sql: &str) -> Vec<String> {
-    extract_table_info(sql).0
+/// Extract per-column constraints from a parsed CREATE TABLE.
+fn extract_constraints(
+    ct: &crate::ast::CreateTableStatement,
+    rowid_col: Option<usize>,
+) -> Vec<vm::ColumnConstraints> {
+    ct.columns
+        .iter()
+        .enumerate()
+        .map(|(i, col)| {
+            let mut cc = vm::ColumnConstraints::default();
+            for constraint in &col.constraints {
+                match constraint {
+                    crate::ast::ColumnConstraint::NotNull => {
+                        cc.not_null = true;
+                    }
+                    crate::ast::ColumnConstraint::PrimaryKey { .. } => {
+                        // PRIMARY KEY implies NOT NULL.
+                        cc.not_null = true;
+                    }
+                    crate::ast::ColumnConstraint::Default(expr) => {
+                        cc.default_value = eval_constant_expr(expr).ok();
+                    }
+                    _ => {}
+                }
+            }
+            // INTEGER PRIMARY KEY columns get their rowid auto-assigned, so
+            // don't enforce NOT NULL on them (NULL means auto-assign).
+            if rowid_col == Some(i) {
+                cc.not_null = false;
+            }
+            cc
+        })
+        .collect()
 }
 
 /// Find the INTEGER PRIMARY KEY column from a parsed CREATE TABLE statement.
 fn find_integer_primary_key(ct: &crate::ast::CreateTableStatement) -> Option<usize> {
     for (i, col) in ct.columns.iter().enumerate() {
-        let has_pk = col.constraints.iter().any(|c| {
-            matches!(c, crate::ast::ColumnConstraint::PrimaryKey { .. })
-        });
+        let has_pk = col
+            .constraints
+            .iter()
+            .any(|c| matches!(c, crate::ast::ColumnConstraint::PrimaryKey { .. }));
         if has_pk {
             // Check if the type is INTEGER (case-insensitive).
             if let Some(ref type_name) = col.type_name {
@@ -958,10 +1230,7 @@ fn find_integer_primary_key(ct: &crate::ast::CreateTableStatement) -> Option<usi
 fn detect_integer_pk_text(sql: &str, columns: &[String]) -> Option<usize> {
     let upper = sql.to_uppercase();
     for (i, col) in columns.iter().enumerate() {
-        let pattern = format!(
-            "{} INTEGER PRIMARY KEY",
-            col.to_uppercase()
-        );
+        let pattern = format!("{} INTEGER PRIMARY KEY", col.to_uppercase());
         if upper.contains(&pattern) {
             return Some(i);
         }
@@ -1043,19 +1312,19 @@ fn extract_first_identifier(s: &str) -> Option<String> {
     }
 
     // Check for quoted identifier.
-    if s.starts_with('"') {
-        if let Some(end) = s[1..].find('"') {
-            return Some(s[1..1 + end].to_string());
+    if let Some(stripped) = s.strip_prefix('"') {
+        if let Some(end) = stripped.find('"') {
+            return Some(stripped[..end].to_string());
         }
     }
-    if s.starts_with('`') {
-        if let Some(end) = s[1..].find('`') {
-            return Some(s[1..1 + end].to_string());
+    if let Some(stripped) = s.strip_prefix('`') {
+        if let Some(end) = stripped.find('`') {
+            return Some(stripped[..end].to_string());
         }
     }
-    if s.starts_with('[') {
-        if let Some(end) = s[1..].find(']') {
-            return Some(s[1..1 + end].to_string());
+    if let Some(stripped) = s.strip_prefix('[') {
+        if let Some(end) = stripped.find(']') {
+            return Some(stripped[..end].to_string());
         }
     }
 
@@ -1145,7 +1414,7 @@ fn reconstruct_create_table_sql(ct: &crate::ast::CreateTableStatement) -> String
                 crate::ast::ColumnConstraint::Unique => sql.push_str(" UNIQUE"),
                 crate::ast::ColumnConstraint::Default(expr) => {
                     sql.push_str(" DEFAULT ");
-                    sql.push_str(&format!("{expr:?}"));
+                    sql.push_str(&expr_to_sql(expr));
                 }
                 _ => {}
             }
@@ -1184,6 +1453,47 @@ fn reconstruct_create_table_sql(ct: &crate::ast::CreateTableStatement) -> String
     sql
 }
 
+/// Convert an expression to SQL text for storage in sqlite_master.
+fn expr_to_sql(expr: &Expr) -> String {
+    match expr {
+        Expr::Literal(lit) => match lit {
+            LiteralValue::Integer(i) => i.to_string(),
+            LiteralValue::Real(f) => format!("{f}"),
+            LiteralValue::String(s) => format!("'{}'", s.replace('\'', "''")),
+            LiteralValue::Blob(b) => {
+                let hex: String = b.iter().map(|byte| format!("{byte:02X}")).collect();
+                format!("X'{hex}'")
+            }
+            LiteralValue::Null => "NULL".to_string(),
+            LiteralValue::CurrentTime => "CURRENT_TIME".to_string(),
+            LiteralValue::CurrentDate => "CURRENT_DATE".to_string(),
+            LiteralValue::CurrentTimestamp => "CURRENT_TIMESTAMP".to_string(),
+        },
+        Expr::UnaryOp {
+            op: crate::ast::UnaryOp::Negate,
+            operand,
+        } => format!("-{}", expr_to_sql(operand)),
+        Expr::Parenthesized(inner) => format!("({})", expr_to_sql(inner)),
+        Expr::FunctionCall { name, args } => {
+            let args_str = match args {
+                FunctionArgs::Wildcard => "*".to_string(),
+                FunctionArgs::Exprs { args, .. } => {
+                    args.iter().map(expr_to_sql).collect::<Vec<_>>().join(", ")
+                }
+            };
+            format!("{name}({args_str})")
+        }
+        Expr::ColumnRef { table, column } => {
+            if let Some(t) = table {
+                format!("{t}.{column}")
+            } else {
+                column.clone()
+            }
+        }
+        _ => format!("{expr:?}"), // Fallback for complex expressions
+    }
+}
+
 /// Update the root page number for a table in sqlite_master.
 fn update_root_page(pager: &mut Pager, table_name: &str, new_root: u32) -> Result<()> {
     let mut cursor = btree::BTreeCursor::new(1);
@@ -1215,10 +1525,7 @@ fn update_root_page(pager: &mut Pager, table_name: &str, new_root: u32) -> Resul
 }
 
 /// Execute a PRAGMA statement.
-fn execute_pragma(
-    pragma: &crate::ast::PragmaStatement,
-    pager: &mut Pager,
-) -> Result<QueryResult> {
+fn execute_pragma(pragma: &crate::ast::PragmaStatement, pager: &mut Pager) -> Result<QueryResult> {
     let name = pragma.name.to_lowercase();
 
     match name.as_str() {
@@ -1235,15 +1542,29 @@ fn execute_pragma(
             };
 
             let schema_entries = schema::read_schema(pager)?;
-            let entry = schema::find_table(&schema_entries, &table_name).ok_or_else(|| {
-                RsqliteError::Runtime(format!("no such table: {table_name}"))
-            })?;
+            let entry = schema::find_table(&schema_entries, &table_name)
+                .ok_or_else(|| RsqliteError::Runtime(format!("no such table: {table_name}")))?;
 
-            let columns = if let Some(ref sql) = entry.sql {
-                extract_column_names(sql)
+            let info = if let Some(ref sql) = entry.sql {
+                extract_table_info(sql)
             } else {
-                vec![]
+                FullTableInfo {
+                    columns: vec![],
+                    rowid_column: None,
+                    constraints: vec![],
+                }
             };
+
+            // Also parse column types and PK status from the CREATE TABLE AST.
+            let parsed = entry.sql.as_ref().and_then(|sql| {
+                crate::parser::parse(sql).ok().and_then(|s| {
+                    if let Statement::CreateTable(ct) = s {
+                        Some(ct)
+                    } else {
+                        None
+                    }
+                })
+            });
 
             let col_infos = vec![
                 ColumnInfo {
@@ -1272,18 +1593,48 @@ fn execute_pragma(
                 },
             ];
 
-            let rows: Vec<Row> = columns
+            let rows: Vec<Row> = info
+                .columns
                 .iter()
                 .enumerate()
-                .map(|(i, name)| Row {
-                    values: vec![
-                        Value::Integer(i as i64),
-                        Value::Text(name.clone()),
-                        Value::Text(String::new()), // type - would need parsing
-                        Value::Integer(0),           // notnull
-                        Value::Null,                 // dflt_value
-                        Value::Integer(0),           // pk
-                    ],
+                .map(|(i, name)| {
+                    let (type_name, notnull, dflt, pk) = if let Some(ref ct) = parsed {
+                        if let Some(col_def) = ct.columns.get(i) {
+                            let tn = col_def.type_name.clone().unwrap_or_default();
+                            let nn = col_def.constraints.iter().any(|c| {
+                                matches!(
+                                    c,
+                                    crate::ast::ColumnConstraint::NotNull
+                                        | crate::ast::ColumnConstraint::PrimaryKey { .. }
+                                )
+                            });
+                            let df = col_def.constraints.iter().find_map(|c| {
+                                if let crate::ast::ColumnConstraint::Default(expr) = c {
+                                    eval_constant_expr(expr).ok()
+                                } else {
+                                    None
+                                }
+                            });
+                            let is_pk = col_def.constraints.iter().any(|c| {
+                                matches!(c, crate::ast::ColumnConstraint::PrimaryKey { .. })
+                            });
+                            (tn, nn, df, is_pk)
+                        } else {
+                            (String::new(), false, None, false)
+                        }
+                    } else {
+                        (String::new(), false, None, false)
+                    };
+                    Row {
+                        values: vec![
+                            Value::Integer(i as i64),
+                            Value::Text(name.clone()),
+                            Value::Text(type_name),
+                            Value::Integer(if notnull { 1 } else { 0 }),
+                            dflt.unwrap_or(Value::Null),
+                            Value::Integer(if pk { 1 } else { 0 }),
+                        ],
+                    }
                 })
                 .collect();
 
@@ -1310,6 +1661,176 @@ fn execute_pragma(
                 }],
                 rows: vec![Row {
                     values: vec![Value::Integer(count as i64)],
+                }],
+            })
+        }
+        "database_list" => Ok(QueryResult {
+            columns: vec![
+                ColumnInfo {
+                    name: "seq".into(),
+                    table: None,
+                },
+                ColumnInfo {
+                    name: "name".into(),
+                    table: None,
+                },
+                ColumnInfo {
+                    name: "file".into(),
+                    table: None,
+                },
+            ],
+            rows: vec![Row {
+                values: vec![
+                    Value::Integer(0),
+                    Value::Text("main".into()),
+                    Value::Text(
+                        pager
+                            .path()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                    ),
+                ],
+            }],
+        }),
+        "journal_mode" => Ok(QueryResult {
+            columns: vec![ColumnInfo {
+                name: "journal_mode".into(),
+                table: None,
+            }],
+            rows: vec![Row {
+                values: vec![Value::Text("delete".into())],
+            }],
+        }),
+        "index_list" => {
+            let table_name = match &pragma.value {
+                Some(crate::ast::PragmaValue::Name(n)) => n.clone(),
+                Some(crate::ast::PragmaValue::StringLiteral(s)) => s.clone(),
+                _ => {
+                    return Err(RsqliteError::Runtime(
+                        "PRAGMA index_list requires a table name".into(),
+                    ))
+                }
+            };
+            let schema_entries = schema::read_schema(pager)?;
+            let cols = vec![
+                ColumnInfo {
+                    name: "seq".into(),
+                    table: None,
+                },
+                ColumnInfo {
+                    name: "name".into(),
+                    table: None,
+                },
+                ColumnInfo {
+                    name: "unique".into(),
+                    table: None,
+                },
+                ColumnInfo {
+                    name: "origin".into(),
+                    table: None,
+                },
+                ColumnInfo {
+                    name: "partial".into(),
+                    table: None,
+                },
+            ];
+            let mut rows = Vec::new();
+            let mut seq = 0i64;
+            for entry in &schema_entries {
+                if entry.entry_type == "index" && entry.tbl_name.eq_ignore_ascii_case(&table_name) {
+                    let is_unique = entry
+                        .sql
+                        .as_ref()
+                        .is_some_and(|s| s.to_uppercase().contains("UNIQUE"));
+                    rows.push(Row {
+                        values: vec![
+                            Value::Integer(seq),
+                            Value::Text(entry.name.clone()),
+                            Value::Integer(if is_unique { 1 } else { 0 }),
+                            Value::Text("c".into()),
+                            Value::Integer(0),
+                        ],
+                    });
+                    seq += 1;
+                }
+            }
+            Ok(QueryResult {
+                columns: cols,
+                rows,
+            })
+        }
+        "index_info" => {
+            let index_name = match &pragma.value {
+                Some(crate::ast::PragmaValue::Name(n)) => n.clone(),
+                Some(crate::ast::PragmaValue::StringLiteral(s)) => s.clone(),
+                _ => {
+                    return Err(RsqliteError::Runtime(
+                        "PRAGMA index_info requires an index name".into(),
+                    ))
+                }
+            };
+            let schema_entries = schema::read_schema(pager)?;
+            let idx_entry = schema_entries
+                .iter()
+                .find(|e| e.entry_type == "index" && e.name.eq_ignore_ascii_case(&index_name));
+            let cols = vec![
+                ColumnInfo {
+                    name: "seqno".into(),
+                    table: None,
+                },
+                ColumnInfo {
+                    name: "cid".into(),
+                    table: None,
+                },
+                ColumnInfo {
+                    name: "name".into(),
+                    table: None,
+                },
+            ];
+            let mut rows = Vec::new();
+            if let Some(entry) = idx_entry {
+                if let Some(ref sql) = entry.sql {
+                    if let Ok(Statement::CreateIndex(ci)) = crate::parser::parse(sql) {
+                        // Get parent table columns.
+                        let table_entry = schema::find_table(&schema_entries, &ci.table);
+                        let table_cols = table_entry
+                            .and_then(|e| e.sql.as_ref())
+                            .map(|sql| extract_table_info(sql).columns)
+                            .unwrap_or_default();
+
+                        for (seq, ic) in ci.columns.iter().enumerate() {
+                            let cid = table_cols
+                                .iter()
+                                .position(|c| c.eq_ignore_ascii_case(&ic.name));
+                            rows.push(Row {
+                                values: vec![
+                                    Value::Integer(seq as i64),
+                                    Value::Integer(cid.map_or(-1, |c| c as i64)),
+                                    Value::Text(ic.name.clone()),
+                                ],
+                            });
+                        }
+                    }
+                }
+            }
+            Ok(QueryResult {
+                columns: cols,
+                rows,
+            })
+        }
+        "schema_version" | "user_version" => {
+            let val = if name == "schema_version" {
+                pager.header.schema_cookie as i64
+            } else {
+                0 // user_version not tracked yet
+            };
+            Ok(QueryResult {
+                columns: vec![ColumnInfo {
+                    name: name.clone(),
+                    table: None,
+                }],
+                rows: vec![Row {
+                    values: vec![Value::Integer(val)],
                 }],
             })
         }
@@ -1389,9 +1910,7 @@ mod tests {
                 name: "users".into(),
                 tbl_name: "users".into(),
                 rootpage: 2,
-                sql: Some(
-                    "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)".into(),
-                ),
+                sql: Some("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)".into()),
             },
             SchemaEntry {
                 entry_type: "index".into(),
@@ -1431,8 +1950,7 @@ mod tests {
 
     #[test]
     fn test_extract_column_names_foreign_key() {
-        let sql =
-            "CREATE TABLE t (id INT, ref_id INT, FOREIGN KEY (ref_id) REFERENCES other(id))";
+        let sql = "CREATE TABLE t (id INT, ref_id INT, FOREIGN KEY (ref_id) REFERENCES other(id))";
         let cols = extract_column_names_text(sql);
         assert_eq!(cols, vec!["id", "ref_id"]);
     }
@@ -1446,8 +1964,7 @@ mod tests {
 
     #[test]
     fn test_extract_column_names_constraint_keyword() {
-        let sql =
-            "CREATE TABLE t (a INT, b INT, CONSTRAINT pk PRIMARY KEY (a))";
+        let sql = "CREATE TABLE t (a INT, b INT, CONSTRAINT pk PRIMARY KEY (a))";
         let cols = extract_column_names_text(sql);
         assert_eq!(cols, vec!["a", "b"]);
     }
@@ -1495,10 +2012,7 @@ mod tests {
 
         // Verify schema reading works.
         let tables = db.table_names().unwrap();
-        assert!(
-            tables.iter().any(|t| t == "users"),
-            "users table not found"
-        );
+        assert!(tables.iter().any(|t| t == "users"), "users table not found");
 
         // Read the schema and build table schemas.
         let entries = db.schema().unwrap();
@@ -1506,7 +2020,11 @@ mod tests {
 
         let users_schema = table_schemas.iter().find(|s| s.name == "users").unwrap();
         assert_eq!(users_schema.columns, vec!["id", "name", "age"]);
-        assert_eq!(users_schema.rowid_column, Some(0), "id should be detected as INTEGER PRIMARY KEY");
+        assert_eq!(
+            users_schema.rowid_column,
+            Some(0),
+            "id should be detected as INTEGER PRIMARY KEY"
+        );
         assert!(users_schema.root_page > 0);
 
         // Execute a full table scan using the VM directly.
@@ -1525,10 +2043,10 @@ mod tests {
             having: None,
             order_by: None,
             limit: None,
+            compound: vec![],
         };
 
-        let result =
-            vm::execute_select(&mut db.pager, &select, &table_schemas).unwrap();
+        let result = vm::execute_select(&mut db.pager, &select, &table_schemas).unwrap();
 
         assert_eq!(result.columns.len(), 3);
         assert_eq!(result.columns[0].name, "id");
@@ -1609,18 +2127,18 @@ mod tests {
                     column: "price".into(),
                 }),
                 op: crate::ast::BinaryOp::Gt,
-                right: Box::new(crate::ast::Expr::Literal(
-                    crate::ast::LiteralValue::Real(2.0),
-                )),
+                right: Box::new(crate::ast::Expr::Literal(crate::ast::LiteralValue::Real(
+                    2.0,
+                ))),
             }),
             group_by: None,
             having: None,
             order_by: None,
             limit: None,
+            compound: vec![],
         };
 
-        let result =
-            vm::execute_select(&mut db.pager, &select, &table_schemas).unwrap();
+        let result = vm::execute_select(&mut db.pager, &select, &table_schemas).unwrap();
 
         assert_eq!(result.rows.len(), 2);
         // Cherry (3.00) and Date (5.00) should match.
@@ -1813,8 +2331,7 @@ mod tests {
         let mut db = Database::in_memory();
         db.execute("CREATE TABLE t (x INTEGER)").unwrap();
 
-        db.execute("INSERT INTO t VALUES (10), (20), (30)")
-            .unwrap();
+        db.execute("INSERT INTO t VALUES (10), (20), (30)").unwrap();
 
         let result = db.execute("SELECT x FROM t").unwrap();
         assert_eq!(result.rows.len(), 3);
@@ -1858,13 +2375,10 @@ mod tests {
         let mut db = Database::in_memory();
         db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
             .unwrap();
-        db.execute("INSERT INTO t VALUES (1, 'Alice', 80)")
-            .unwrap();
-        db.execute("INSERT INTO t VALUES (2, 'Bob', 90)")
-            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'Alice', 80)").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'Bob', 90)").unwrap();
 
-        db.execute("UPDATE t SET score = 95 WHERE id = 1")
-            .unwrap();
+        db.execute("UPDATE t SET score = 95 WHERE id = 1").unwrap();
 
         let result = db.execute("SELECT * FROM t ORDER BY id").unwrap();
         assert_eq!(result.rows[0].values[2], Value::Integer(95));
@@ -1917,8 +2431,7 @@ mod tests {
             .unwrap();
         db.execute("INSERT INTO scores VALUES ('Alice', 90)")
             .unwrap();
-        db.execute("INSERT INTO scores VALUES ('Bob', 85)")
-            .unwrap();
+        db.execute("INSERT INTO scores VALUES ('Bob', 85)").unwrap();
         db.execute("INSERT INTO scores VALUES ('Alice', 95)")
             .unwrap();
 
@@ -1966,9 +2479,21 @@ mod tests {
         let stdout = String::from_utf8(output.stdout).unwrap();
         let lines: Vec<&str> = stdout.trim().lines().collect();
         assert_eq!(lines.len(), 3, "sqlite3 output: {stdout}");
-        assert!(lines[0].contains("Widget"), "expected Widget in: {}", lines[0]);
-        assert!(lines[1].contains("Gadget"), "expected Gadget in: {}", lines[1]);
-        assert!(lines[2].contains("Doohickey"), "expected Doohickey in: {}", lines[2]);
+        assert!(
+            lines[0].contains("Widget"),
+            "expected Widget in: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("Gadget"),
+            "expected Gadget in: {}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("Doohickey"),
+            "expected Doohickey in: {}",
+            lines[2]
+        );
     }
 
     #[test]
@@ -1979,10 +2504,7 @@ mod tests {
 
         // Insert enough rows that the page should split.
         for i in 1..=100 {
-            let sql = format!(
-                "INSERT INTO big VALUES ({i}, '{}')",
-                "x".repeat(20)
-            );
+            let sql = format!("INSERT INTO big VALUES ({i}, '{}')", "x".repeat(20));
             db.execute(&sql).unwrap();
         }
 
@@ -2056,10 +2578,7 @@ mod tests {
         assert_eq!(result.rows[3].values[1], Value::Null);
         // Alice is first (id=1), department = Engineering.
         assert_eq!(result.rows[0].values[0], Value::Text("Alice".into()));
-        assert_eq!(
-            result.rows[0].values[1],
-            Value::Text("Engineering".into())
-        );
+        assert_eq!(result.rows[0].values[1], Value::Text("Engineering".into()));
     }
 
     #[test]
@@ -2129,10 +2648,7 @@ mod tests {
             .unwrap();
         // Engineering: 2 (Alice, Charlie), Sales: 1 (Bob)
         assert_eq!(result.rows.len(), 2);
-        assert_eq!(
-            result.rows[0].values[0],
-            Value::Text("Engineering".into())
-        );
+        assert_eq!(result.rows[0].values[0], Value::Text("Engineering".into()));
         assert_eq!(result.rows[0].values[1], Value::Integer(2));
         assert_eq!(result.rows[1].values[0], Value::Text("Sales".into()));
         assert_eq!(result.rows[1].values[1], Value::Integer(1));
@@ -2152,22 +2668,24 @@ mod tests {
             .unwrap();
         assert_eq!(result.rows.len(), 3);
         assert_eq!(result.rows[0].values[0], Value::Text("Alice".into()));
-        assert_eq!(
-            result.rows[0].values[1],
-            Value::Text("Engineering".into())
-        );
+        assert_eq!(result.rows[0].values[1], Value::Text("Engineering".into()));
     }
 
     #[test]
     fn test_left_join_unmatched_right() {
         let mut db = Database::in_memory();
-        db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount REAL)")
-            .unwrap();
+        db.execute(
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount REAL)",
+        )
+        .unwrap();
         db.execute("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)")
             .unwrap();
-        db.execute("INSERT INTO customers VALUES (1, 'Alice')").unwrap();
-        db.execute("INSERT INTO customers VALUES (2, 'Bob')").unwrap();
-        db.execute("INSERT INTO orders VALUES (1, 1, 99.99)").unwrap();
+        db.execute("INSERT INTO customers VALUES (1, 'Alice')")
+            .unwrap();
+        db.execute("INSERT INTO customers VALUES (2, 'Bob')")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 1, 99.99)")
+            .unwrap();
 
         let result = db
             .execute(
@@ -2186,8 +2704,10 @@ mod tests {
     #[test]
     fn test_self_join() {
         let mut db = Database::in_memory();
-        db.execute("CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, manager_id INTEGER)")
-            .unwrap();
+        db.execute(
+            "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, manager_id INTEGER)",
+        )
+        .unwrap();
         db.execute("INSERT INTO employees VALUES (1, 'Boss', NULL)")
             .unwrap();
         db.execute("INSERT INTO employees VALUES (2, 'Alice', 1)")
@@ -2283,9 +2803,12 @@ mod tests {
     #[test]
     fn test_scalar_functions_with_table_data() {
         let mut db = Database::in_memory();
-        db.execute("CREATE TABLE t (name TEXT, val INTEGER)").unwrap();
-        db.execute("INSERT INTO t VALUES ('Hello World', 42)").unwrap();
-        db.execute("INSERT INTO t VALUES ('  spaces  ', -7)").unwrap();
+        db.execute("CREATE TABLE t (name TEXT, val INTEGER)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES ('Hello World', 42)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES ('  spaces  ', -7)")
+            .unwrap();
 
         let r = db
             .execute("SELECT upper(name), abs(val) FROM t ORDER BY rowid")
@@ -2442,9 +2965,7 @@ mod tests {
         db.execute("INSERT INTO t VALUES (20)").unwrap();
         db.execute("INSERT INTO t VALUES (30)").unwrap();
 
-        let r = db
-            .execute("SELECT (SELECT MAX(val) FROM t)")
-            .unwrap();
+        let r = db.execute("SELECT (SELECT MAX(val) FROM t)").unwrap();
         assert_eq!(r.rows[0].values[0], Value::Integer(30));
     }
 
@@ -2494,9 +3015,7 @@ mod tests {
         assert!(idx.is_some(), "index should appear in schema");
 
         // Data should still be queryable.
-        let r = db
-            .execute("SELECT name FROM items ORDER BY name")
-            .unwrap();
+        let r = db.execute("SELECT name FROM items ORDER BY name").unwrap();
         assert_eq!(r.rows.len(), 3);
         assert_eq!(r.rows[0].values[0], Value::Text("apple".into()));
         assert_eq!(r.rows[1].values[0], Value::Text("banana".into()));
@@ -2560,10 +3079,7 @@ mod tests {
 
         // Verify the index has entries by scanning it.
         let entries = db.schema().unwrap();
-        let idx_entry = entries
-            .iter()
-            .find(|e| e.name == "idx_t_val")
-            .unwrap();
+        let idx_entry = entries.iter().find(|e| e.name == "idx_t_val").unwrap();
         let idx_root = idx_entry.rootpage as u32;
 
         // Read index entries.
@@ -2603,10 +3119,7 @@ mod tests {
 
         // Verify index no longer contains the deleted entry.
         let entries = db.schema().unwrap();
-        let idx_entry = entries
-            .iter()
-            .find(|e| e.name == "idx_t_val")
-            .unwrap();
+        let idx_entry = entries.iter().find(|e| e.name == "idx_t_val").unwrap();
         let idx_root = idx_entry.rootpage as u32;
 
         let mut cursor = btree::BTreeCursor::new(idx_root);
@@ -2646,10 +3159,7 @@ mod tests {
 
         // Verify the index reflects the update.
         let entries = db.schema().unwrap();
-        let idx_entry = entries
-            .iter()
-            .find(|e| e.name == "idx_t_val")
-            .unwrap();
+        let idx_entry = entries.iter().find(|e| e.name == "idx_t_val").unwrap();
         let idx_root = idx_entry.rootpage as u32;
 
         let mut cursor = btree::BTreeCursor::new(idx_root);
@@ -2681,10 +3191,7 @@ mod tests {
 
         // Schema should show UNIQUE.
         let entries = db.schema().unwrap();
-        let idx = entries
-            .iter()
-            .find(|e| e.name == "idx_t_email")
-            .unwrap();
+        let idx = entries.iter().find(|e| e.name == "idx_t_email").unwrap();
         assert!(idx.sql.as_ref().unwrap().contains("UNIQUE"));
     }
 
@@ -2700,10 +3207,7 @@ mod tests {
 
         // Verify the index has entries.
         let entries = db.schema().unwrap();
-        let idx_entry = entries
-            .iter()
-            .find(|e| e.name == "idx_t_ab")
-            .unwrap();
+        let idx_entry = entries.iter().find(|e| e.name == "idx_t_ab").unwrap();
         let idx_root = idx_entry.rootpage as u32;
 
         let mut cursor = btree::BTreeCursor::new(idx_root);
@@ -2804,7 +3308,9 @@ mod tests {
         db.execute("INSERT INTO b VALUES (1, 1)").unwrap();
         db.execute("COMMIT").unwrap();
 
-        let r = db.execute("SELECT a.val FROM a INNER JOIN b ON a.id = b.ref_id").unwrap();
+        let r = db
+            .execute("SELECT a.val FROM a INNER JOIN b ON a.id = b.ref_id")
+            .unwrap();
         assert_eq!(r.rows.len(), 1);
         assert_eq!(r.rows[0].values[0], Value::Text("hello".into()));
     }
@@ -2818,8 +3324,7 @@ mod tests {
             let mut db = Database::open(&db_path).unwrap();
             db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
                 .unwrap();
-            db.execute("INSERT INTO t VALUES (1, 'persisted')")
-                .unwrap();
+            db.execute("INSERT INTO t VALUES (1, 'persisted')").unwrap();
 
             db.execute("BEGIN").unwrap();
             db.execute("INSERT INTO t VALUES (2, 'rolled_back')")
@@ -2838,5 +3343,230 @@ mod tests {
             assert_eq!(r.rows.len(), 1);
             assert_eq!(r.rows[0].values[0], Value::Text("persisted".into()));
         }
+    }
+
+    // -- Constraint enforcement tests --
+
+    #[test]
+    fn test_not_null_constraint_insert() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            .unwrap();
+        // Valid insert should work.
+        db.execute("INSERT INTO t VALUES (1, 'Alice')").unwrap();
+        // NULL in NOT NULL column should fail.
+        let err = db.execute("INSERT INTO t VALUES (2, NULL)").unwrap_err();
+        assert!(err.to_string().contains("NOT NULL constraint failed"));
+    }
+
+    #[test]
+    fn test_not_null_constraint_update() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'Alice')").unwrap();
+        let err = db
+            .execute("UPDATE t SET name = NULL WHERE id = 1")
+            .unwrap_err();
+        assert!(err.to_string().contains("NOT NULL constraint failed"));
+    }
+
+    #[test]
+    fn test_default_value_applied() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, status TEXT DEFAULT 'active', count INTEGER DEFAULT 0)")
+            .unwrap();
+        db.execute("INSERT INTO t (id) VALUES (1)").unwrap();
+        let r = db
+            .execute("SELECT status, count FROM t WHERE id = 1")
+            .unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Text("active".into()));
+        assert_eq!(r.rows[0].values[1], Value::Integer(0));
+    }
+
+    #[test]
+    fn test_default_value_not_applied_when_explicit() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, status TEXT DEFAULT 'active')")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'inactive')").unwrap();
+        let r = db.execute("SELECT status FROM t WHERE id = 1").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Text("inactive".into()));
+    }
+
+    #[test]
+    fn test_not_null_with_default() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT NOT NULL DEFAULT 'hello')")
+            .unwrap();
+        // Omitting the column should use the default, not fail NOT NULL.
+        db.execute("INSERT INTO t (id) VALUES (1)").unwrap();
+        let r = db.execute("SELECT val FROM t WHERE id = 1").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Text("hello".into()));
+    }
+
+    #[test]
+    fn test_pragma_table_info_with_types() {
+        let mut db = Database::in_memory();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER DEFAULT 0)",
+        )
+        .unwrap();
+        let r = db.execute("PRAGMA table_info(t)").unwrap();
+        assert_eq!(r.rows.len(), 3);
+        // id column: type=INTEGER, notnull=1, pk=1
+        assert_eq!(r.rows[0].values[1], Value::Text("id".into()));
+        assert_eq!(r.rows[0].values[2], Value::Text("INTEGER".into()));
+        assert_eq!(r.rows[0].values[5], Value::Integer(1)); // pk
+                                                            // name column: notnull=1
+        assert_eq!(r.rows[1].values[3], Value::Integer(1)); // notnull
+                                                            // age column: default=0
+        assert_eq!(r.rows[2].values[4], Value::Integer(0)); // default
+    }
+
+    // -- ALTER TABLE tests --
+
+    #[test]
+    fn test_alter_table_rename() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE old_name (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO old_name VALUES (1, 'hello')")
+            .unwrap();
+        db.execute("ALTER TABLE old_name RENAME TO new_name")
+            .unwrap();
+        // Old name should not work.
+        assert!(db.execute("SELECT * FROM old_name").is_err());
+        // New name should work and preserve data.
+        let r = db.execute("SELECT val FROM new_name").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Text("hello".into()));
+    }
+
+    #[test]
+    fn test_alter_table_add_column() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'Alice')").unwrap();
+        db.execute("ALTER TABLE t ADD COLUMN age INTEGER").unwrap();
+        // Existing rows should have NULL for the new column.
+        let r = db.execute("SELECT age FROM t WHERE id = 1").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Null);
+        // New inserts should include the column.
+        db.execute("INSERT INTO t VALUES (2, 'Bob', 30)").unwrap();
+        let r = db.execute("SELECT age FROM t WHERE id = 2").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Integer(30));
+    }
+
+    #[test]
+    fn test_alter_table_rename_column() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, old_col TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'test')").unwrap();
+        db.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col")
+            .unwrap();
+        let r = db.execute("SELECT new_col FROM t WHERE id = 1").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Text("test".into()));
+    }
+
+    #[test]
+    fn test_alter_table_drop_column() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'keep', 'drop')")
+            .unwrap();
+        db.execute("ALTER TABLE t DROP COLUMN b").unwrap();
+        let r = db.execute("SELECT * FROM t WHERE id = 1").unwrap();
+        assert_eq!(r.rows[0].values.len(), 2); // id + a
+        assert_eq!(r.rows[0].values[1], Value::Text("keep".into()));
+    }
+
+    // -- INSERT...SELECT tests --
+
+    #[test]
+    fn test_insert_select() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO src VALUES (1, 'a')").unwrap();
+        db.execute("INSERT INTO src VALUES (2, 'b')").unwrap();
+        db.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO dst SELECT * FROM src").unwrap();
+        let r = db.execute("SELECT COUNT(*) FROM dst").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Integer(2));
+    }
+
+    // -- UNION / INTERSECT / EXCEPT tests --
+
+    #[test]
+    fn test_union_all() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (v INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1)").unwrap();
+        db.execute("INSERT INTO t VALUES (2)").unwrap();
+        let r = db
+            .execute("SELECT v FROM t UNION ALL SELECT v FROM t")
+            .unwrap();
+        assert_eq!(r.rows.len(), 4);
+    }
+
+    #[test]
+    fn test_union_dedup() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (v INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1)").unwrap();
+        db.execute("INSERT INTO t VALUES (2)").unwrap();
+        let r = db.execute("SELECT v FROM t UNION SELECT v FROM t").unwrap();
+        assert_eq!(r.rows.len(), 2);
+    }
+
+    #[test]
+    fn test_intersect() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE a (v INTEGER)").unwrap();
+        db.execute("CREATE TABLE b (v INTEGER)").unwrap();
+        db.execute("INSERT INTO a VALUES (1)").unwrap();
+        db.execute("INSERT INTO a VALUES (2)").unwrap();
+        db.execute("INSERT INTO a VALUES (3)").unwrap();
+        db.execute("INSERT INTO b VALUES (2)").unwrap();
+        db.execute("INSERT INTO b VALUES (3)").unwrap();
+        db.execute("INSERT INTO b VALUES (4)").unwrap();
+        let r = db
+            .execute("SELECT v FROM a INTERSECT SELECT v FROM b")
+            .unwrap();
+        assert_eq!(r.rows.len(), 2);
+    }
+
+    #[test]
+    fn test_except() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE a (v INTEGER)").unwrap();
+        db.execute("CREATE TABLE b (v INTEGER)").unwrap();
+        db.execute("INSERT INTO a VALUES (1)").unwrap();
+        db.execute("INSERT INTO a VALUES (2)").unwrap();
+        db.execute("INSERT INTO a VALUES (3)").unwrap();
+        db.execute("INSERT INTO b VALUES (2)").unwrap();
+        let r = db
+            .execute("SELECT v FROM a EXCEPT SELECT v FROM b")
+            .unwrap();
+        assert_eq!(r.rows.len(), 2);
+    }
+
+    // -- Expression LIMIT/OFFSET tests --
+
+    #[test]
+    fn test_expression_limit() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t (v INTEGER)").unwrap();
+        for i in 1..=10 {
+            db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+        }
+        let r = db
+            .execute("SELECT v FROM t ORDER BY v LIMIT 1 + 2")
+            .unwrap();
+        assert_eq!(r.rows.len(), 3);
     }
 }

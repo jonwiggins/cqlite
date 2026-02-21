@@ -22,7 +22,9 @@ struct Parser<'a> {
 impl<'a> Parser<'a> {
     fn new(sql: &'a str) -> Result<Self> {
         let mut tokenizer = Tokenizer::new(sql);
-        let current = tokenizer.next_token().map_err(|e| RsqliteError::Parse(e.to_string()))?;
+        let current = tokenizer
+            .next_token()
+            .map_err(|e| RsqliteError::Parse(e.to_string()))?;
         Ok(Self { tokenizer, current })
     }
 
@@ -77,7 +79,9 @@ impl<'a> Parser<'a> {
 
     fn parse_statement(&mut self) -> Result<Statement> {
         let stmt = match &self.current {
-            Token::Select => self.parse_select_statement().map(Statement::Select),
+            Token::Select => self
+                .parse_select_statement()
+                .map(|s| Statement::Select(Box::new(s))),
             Token::Insert | Token::Replace => self.parse_insert_statement().map(Statement::Insert),
             Token::Update => self.parse_update_statement().map(Statement::Update),
             Token::Delete => self.parse_delete_statement().map(Statement::Delete),
@@ -177,6 +181,7 @@ impl<'a> Parser<'a> {
                         limit: real_limit,
                         offset: Some(offset),
                     }),
+                    compound: vec![],
                 });
             } else {
                 None
@@ -189,6 +194,31 @@ impl<'a> Parser<'a> {
             None
         };
 
+        // Parse compound operations (UNION, UNION ALL, INTERSECT, EXCEPT).
+        let mut compound = Vec::new();
+        loop {
+            let op = if self.eat_if(&Token::Union)? {
+                if self.eat_if(&Token::All)? {
+                    Some(crate::ast::CompoundOp::UnionAll)
+                } else {
+                    Some(crate::ast::CompoundOp::Union)
+                }
+            } else if self.eat_if(&Token::Intersect)? {
+                Some(crate::ast::CompoundOp::Intersect)
+            } else if self.eat_if(&Token::Except)? {
+                Some(crate::ast::CompoundOp::Except)
+            } else {
+                None
+            };
+
+            if let Some(op) = op {
+                let rhs = self.parse_select_statement()?;
+                compound.push(crate::ast::CompoundClause { op, select: rhs });
+            } else {
+                break;
+            }
+        }
+
         Ok(SelectStatement {
             distinct,
             columns,
@@ -198,6 +228,7 @@ impl<'a> Parser<'a> {
             having,
             order_by,
             limit,
+            compound,
         })
     }
 
@@ -327,19 +358,15 @@ impl<'a> Parser<'a> {
             if self.current == Token::Select {
                 let select = self.parse_select_statement()?;
                 self.expect(&Token::RightParen)?;
-                let alias = if self.eat_if(&Token::As)? {
-                    self.parse_identifier()?
-                } else {
-                    self.parse_identifier()?
-                };
+                // AS keyword is optional for subquery aliases.
+                let _ = self.eat_if(&Token::As)?;
+                let alias = self.parse_identifier()?;
                 return Ok(TableRef::Subquery {
                     select: Box::new(select),
                     alias,
                 });
             }
-            return Err(RsqliteError::Parse(
-                "expected SELECT in subquery".into(),
-            ));
+            return Err(RsqliteError::Parse("expected SELECT in subquery".into()));
         }
 
         let name = self.parse_identifier()?;
@@ -731,12 +758,12 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_type_name(&mut self) -> Result<String> {
-        let mut name = self.parse_identifier()?;
+        let mut name = self.parse_identifier_preserve_case()?;
 
         // Handle multi-word types like "DOUBLE PRECISION", "VARYING CHARACTER(100)".
         // Keep consuming identifiers that look like type modifiers.
         while let Token::Ident(_) = &self.current {
-            let next = self.parse_identifier()?;
+            let next = self.parse_identifier_preserve_case()?;
             name.push(' ');
             name.push_str(&next);
         }
@@ -791,9 +818,7 @@ impl<'a> Parser<'a> {
                     self.advance()?;
                     Ok(Expr::Literal(LiteralValue::Real(f)))
                 }
-                _ => Err(RsqliteError::Parse(
-                    "expected number after minus".into(),
-                )),
+                _ => Err(RsqliteError::Parse("expected number after minus".into())),
             }
         } else if self.eat_if(&Token::Plus)? {
             match &self.current {
@@ -807,9 +832,7 @@ impl<'a> Parser<'a> {
                     self.advance()?;
                     Ok(Expr::Literal(LiteralValue::Real(f)))
                 }
-                _ => Err(RsqliteError::Parse(
-                    "expected number after plus".into(),
-                )),
+                _ => Err(RsqliteError::Parse("expected number after plus".into())),
             }
         } else {
             self.parse_primary()
@@ -1555,6 +1578,49 @@ impl<'a> Parser<'a> {
         Ok(FunctionArgs::Exprs { distinct, args })
     }
 
+    /// Like parse_identifier but preserves the original case for keyword tokens.
+    /// Used for type names where we want "INTEGER" not "integer".
+    fn parse_identifier_preserve_case(&mut self) -> Result<String> {
+        match &self.current {
+            Token::Ident(s) => {
+                let s = s.clone();
+                self.advance()?;
+                Ok(s)
+            }
+            Token::Table
+            | Token::Index
+            | Token::Key
+            | Token::Column
+            | Token::IntegerKw
+            | Token::RealKw
+            | Token::TextKw
+            | Token::BlobKw
+            | Token::NumericKw
+            | Token::Replace
+            | Token::Abort
+            | Token::Conflict
+            | Token::Fail
+            | Token::Ignore
+            | Token::Plan
+            | Token::Query
+            | Token::Rename
+            | Token::Savepoint
+            | Token::Transaction
+            | Token::Release
+            | Token::Recursive
+            | Token::Right
+            | Token::Outer => {
+                let name = format!("{}", self.current).to_uppercase();
+                self.advance()?;
+                Ok(name)
+            }
+            _ => Err(RsqliteError::Parse(format!(
+                "expected identifier, got {:?}",
+                self.current
+            ))),
+        }
+    }
+
     fn parse_identifier(&mut self) -> Result<String> {
         match &self.current {
             Token::Ident(s) => {
@@ -1598,7 +1664,6 @@ impl<'a> Parser<'a> {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1654,7 +1719,10 @@ mod tests {
         let stmt = parse("SELECT * FROM t LIMIT 10 OFFSET 5").unwrap();
         if let Statement::Select(s) = stmt {
             let lim = s.limit.unwrap();
-            assert!(matches!(lim.limit, Expr::Literal(LiteralValue::Integer(10))));
+            assert!(matches!(
+                lim.limit,
+                Expr::Literal(LiteralValue::Integer(10))
+            ));
             assert!(lim.offset.is_some());
         } else {
             panic!("expected SELECT");
@@ -1708,10 +1776,9 @@ mod tests {
 
     #[test]
     fn test_parse_select_join() {
-        let stmt = parse(
-            "SELECT u.name, o.total FROM users u INNER JOIN orders o ON u.id = o.user_id",
-        )
-        .unwrap();
+        let stmt =
+            parse("SELECT u.name, o.total FROM users u INNER JOIN orders o ON u.id = o.user_id")
+                .unwrap();
         if let Statement::Select(s) = stmt {
             let from = s.from.unwrap();
             assert_eq!(from.joins.len(), 1);
@@ -1723,8 +1790,7 @@ mod tests {
 
     #[test]
     fn test_parse_select_left_join() {
-        let stmt =
-            parse("SELECT * FROM a LEFT JOIN b ON a.id = b.a_id").unwrap();
+        let stmt = parse("SELECT * FROM a LEFT JOIN b ON a.id = b.a_id").unwrap();
         if let Statement::Select(s) = stmt {
             let from = s.from.unwrap();
             assert_eq!(from.joins.len(), 1);
@@ -2049,8 +2115,8 @@ mod tests {
 
     #[test]
     fn test_parse_case_expr() {
-        let stmt = parse("SELECT CASE WHEN x > 0 THEN 'positive' ELSE 'non-positive' END FROM t")
-            .unwrap();
+        let stmt =
+            parse("SELECT CASE WHEN x > 0 THEN 'positive' ELSE 'non-positive' END FROM t").unwrap();
         if let Statement::Select(s) = stmt {
             if let ResultColumn::Expr { expr, .. } = &s.columns[0] {
                 assert!(matches!(expr, Expr::Case { .. }));
@@ -2115,7 +2181,13 @@ mod tests {
         if let Statement::Select(s) = stmt {
             if let ResultColumn::Expr { expr, .. } = &s.columns[0] {
                 // Should be Multiply(Parenthesized(Add(1,2)), 3)
-                assert!(matches!(expr, Expr::BinaryOp { op: BinaryOp::Multiply, .. }));
+                assert!(matches!(
+                    expr,
+                    Expr::BinaryOp {
+                        op: BinaryOp::Multiply,
+                        ..
+                    }
+                ));
             } else {
                 panic!("expected Expr column");
             }
@@ -2155,7 +2227,13 @@ mod tests {
         if let Statement::CreateTable(ct) = stmt {
             assert_eq!(ct.columns[0].name, "id");
             let pk = &ct.columns[0].constraints[0];
-            assert!(matches!(pk, ColumnConstraint::PrimaryKey { autoincrement: true, .. }));
+            assert!(matches!(
+                pk,
+                ColumnConstraint::PrimaryKey {
+                    autoincrement: true,
+                    ..
+                }
+            ));
         } else {
             panic!("expected CREATE TABLE");
         }

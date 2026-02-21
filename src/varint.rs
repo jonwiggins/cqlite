@@ -12,8 +12,7 @@ pub fn read_varint(buf: &[u8]) -> (u64, usize) {
     // The 9th byte (if reached) uses all 8 bits.
     // Bytes 1-8 use 7 bits each (high bit = continuation flag).
     let mut value: u64 = 0;
-    for i in 0..8 {
-        let byte = buf[i];
+    for (i, &byte) in buf.iter().enumerate().take(8) {
         value = (value << 7) | (byte & 0x7F) as u64;
         if byte & 0x80 == 0 {
             return (value, i + 1);
@@ -186,7 +185,19 @@ mod tests {
     #[test]
     fn test_round_trip_various() {
         let mut buf = [0u8; 9];
-        let values = [0, 1, 127, 128, 255, 256, 16383, 16384, 1_000_000, u64::MAX / 2, u64::MAX];
+        let values = [
+            0,
+            1,
+            127,
+            128,
+            255,
+            256,
+            16383,
+            16384,
+            1_000_000,
+            u64::MAX / 2,
+            u64::MAX,
+        ];
         for &val in &values {
             let n = write_varint(&mut buf, val);
             let (decoded, dn) = read_varint(&buf);

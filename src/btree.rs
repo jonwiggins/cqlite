@@ -104,7 +104,11 @@ impl BTreePageHeader {
 /// (within the page) where each cell begins.
 ///
 /// The cell pointer array starts immediately after the B-tree page header.
-pub fn read_cell_pointers(data: &[u8], header_offset: usize, header: &BTreePageHeader) -> Result<Vec<u16>> {
+pub fn read_cell_pointers(
+    data: &[u8],
+    header_offset: usize,
+    header: &BTreePageHeader,
+) -> Result<Vec<u16>> {
     let array_start = header_offset + header.header_size();
     let count = header.cell_count as usize;
 
@@ -181,10 +185,9 @@ fn compute_local_payload_size(
             // but we handle the call gracefully.
             (usable_size - 35, (usable_size - 12) * 32 / 255 - 23)
         }
-        BTreePageType::IndexLeaf | BTreePageType::IndexInterior => (
-            index_max_local(usable_size),
-            index_min_local(usable_size),
-        ),
+        BTreePageType::IndexLeaf | BTreePageType::IndexInterior => {
+            (index_max_local(usable_size), index_min_local(usable_size))
+        }
     };
 
     if payload_size <= max_local {
@@ -476,9 +479,7 @@ fn read_full_payload(
 
         // First 4 bytes of an overflow page: pointer to next overflow page (0 = last).
         if data.len() < 4 {
-            return Err(RsqliteError::Corrupt(
-                "overflow page too small".into(),
-            ));
+            return Err(RsqliteError::Corrupt("overflow page too small".into()));
         }
         let next_overflow = format::read_be_u32(data, 0);
 
@@ -552,7 +553,10 @@ pub fn parse_cell(
 
 /// Parse the B-tree header and all cells on a single page.
 /// Overflow pages are followed to assemble complete payloads.
-pub fn read_page_cells(pager: &mut Pager, page_num: PageNumber) -> Result<(BTreePageHeader, Vec<BTreeCell>)> {
+pub fn read_page_cells(
+    pager: &mut Pager,
+    page_num: PageNumber,
+) -> Result<(BTreePageHeader, Vec<BTreeCell>)> {
     let header_offset = pager::btree_header_offset(page_num);
     let data = pager.get_page(page_num)?.data.clone();
     let header = BTreePageHeader::parse(&data, header_offset)?;
@@ -706,9 +710,7 @@ impl BTreeCursor {
                 };
 
                 return self.descend_to_leftmost(pager, child_page).map(|()| true);
-            } else if parent.cell_index == parent.cell_pointers.len()
-                && parent.right_child != 0
-            {
+            } else if parent.cell_index == parent.cell_pointers.len() && parent.right_child != 0 {
                 // Descend into right_child. We only do this when cell_index
                 // is exactly len() (meaning we just finished the last cell's
                 // subtree). Set cell_index beyond that to mark right_child
@@ -888,9 +890,7 @@ impl BTreeCursor {
                 };
 
                 return self.descend_to_leftmost(pager, child_page);
-            } else if parent.right_child != 0
-                && parent.cell_index == parent.cell_pointers.len()
-            {
+            } else if parent.right_child != 0 && parent.cell_index == parent.cell_pointers.len() {
                 let right_child = parent.right_child;
                 parent.cell_index = parent.cell_pointers.len() + 1;
                 return self.descend_to_leftmost(pager, right_child);
@@ -995,12 +995,8 @@ impl BTreeCursor {
             }
 
             let usable_size = pager.usable_size();
-            let (cell, _, _) = parse_cell_raw(
-                &data,
-                pointers[0] as usize,
-                header.page_type,
-                usable_size,
-            )?;
+            let (cell, _, _) =
+                parse_cell_raw(&data, pointers[0] as usize, header.page_type, usable_size)?;
 
             let child = cell.left_child().ok_or_else(|| {
                 RsqliteError::Corrupt("interior cell missing left child pointer".into())
@@ -1032,7 +1028,7 @@ pub fn init_table_leaf_page(pager: &mut Pager, page_num: PageNumber) -> Result<(
     page.data[header_offset] = BTreePageType::TableLeaf.to_flag();
     format::write_be_u16(&mut page.data, header_offset + 1, 0); // first freeblock
     format::write_be_u16(&mut page.data, header_offset + 3, 0); // cell count
-    // Cell content offset: start at end of page (no cells yet).
+                                                                // Cell content offset: start at end of page (no cells yet).
     format::write_be_u16(&mut page.data, header_offset + 5, page_size as u16);
     page.data[header_offset + 7] = 0; // fragmented free bytes
 
@@ -1176,7 +1172,8 @@ fn insert_into_subtree(
             // Find insertion position (maintain rowid order).
             let mut insert_pos = pointers.len();
             for (i, &ptr) in pointers.iter().enumerate() {
-                let (cell, _, _) = parse_cell_raw(&data, ptr as usize, header.page_type, usable_size)?;
+                let (cell, _, _) =
+                    parse_cell_raw(&data, ptr as usize, header.page_type, usable_size)?;
                 if cell.rowid().unwrap() >= rowid {
                     insert_pos = i;
                     break;
@@ -1184,13 +1181,10 @@ fn insert_into_subtree(
             }
 
             // Check if there's space: need 2 bytes for pointer + cell_data.len() for content.
-            let ptr_array_end = header_offset + header.header_size() + (header.cell_count as usize + 1) * 2;
+            let ptr_array_end =
+                header_offset + header.header_size() + (header.cell_count as usize + 1) * 2;
             let content_start = header.content_offset();
-            let free_space = if content_start > ptr_array_end {
-                content_start - ptr_array_end
-            } else {
-                0
-            };
+            let free_space = content_start.saturating_sub(ptr_array_end);
 
             if free_space >= 2 + cell_data.len() {
                 // Insert in-place.
@@ -1211,7 +1205,8 @@ fn insert_into_subtree(
             let mut child_index = pointers.len(); // means right_child
 
             for (i, &ptr) in pointers.iter().enumerate() {
-                let (cell, _, _) = parse_cell_raw(&data, ptr as usize, header.page_type, usable_size)?;
+                let (cell, _, _) =
+                    parse_cell_raw(&data, ptr as usize, header.page_type, usable_size)?;
                 let key = cell.rowid().unwrap();
                 if rowid <= key {
                     child_page = cell.left_child().unwrap();
@@ -1239,14 +1234,13 @@ fn insert_into_subtree(
 
                     // Re-read page header (may have changed).
                     let data = pager.get_page(page_num)?.data.clone();
-                    let header = BTreePageHeader::parse(&data, pager::btree_header_offset(page_num))?;
-                    let ptr_array_end = pager::btree_header_offset(page_num) + header.header_size() + (header.cell_count as usize + 1) * 2;
+                    let header =
+                        BTreePageHeader::parse(&data, pager::btree_header_offset(page_num))?;
+                    let ptr_array_end = pager::btree_header_offset(page_num)
+                        + header.header_size()
+                        + (header.cell_count as usize + 1) * 2;
                     let content_start = header.content_offset();
-                    let free_space = if content_start > ptr_array_end {
-                        content_start - ptr_array_end
-                    } else {
-                        0
-                    };
+                    let free_space = content_start.saturating_sub(ptr_array_end);
 
                     if free_space >= 2 + int_cell.len() {
                         // Insert the interior cell at child_index.
@@ -1451,20 +1445,12 @@ fn rewrite_leaf_page(
 
 /// Delete a row from a table B-tree by rowid.
 /// Returns true if the row was found and deleted.
-pub fn btree_delete(
-    pager: &mut Pager,
-    root_page: PageNumber,
-    rowid: i64,
-) -> Result<bool> {
+pub fn btree_delete(pager: &mut Pager, root_page: PageNumber, rowid: i64) -> Result<bool> {
     delete_from_subtree(pager, root_page, rowid)
 }
 
 /// Delete a cell with the given rowid from the subtree rooted at `page_num`.
-fn delete_from_subtree(
-    pager: &mut Pager,
-    page_num: PageNumber,
-    rowid: i64,
-) -> Result<bool> {
+fn delete_from_subtree(pager: &mut Pager, page_num: PageNumber, rowid: i64) -> Result<bool> {
     let header_offset = pager::btree_header_offset(page_num);
     let data = pager.get_page(page_num)?.data.clone();
     let header = BTreePageHeader::parse(&data, header_offset)?;
@@ -1476,7 +1462,8 @@ fn delete_from_subtree(
 
             // Find the cell with matching rowid.
             for (i, &ptr) in pointers.iter().enumerate() {
-                let (cell, _, _) = parse_cell_raw(&data, ptr as usize, header.page_type, usable_size)?;
+                let (cell, _, _) =
+                    parse_cell_raw(&data, ptr as usize, header.page_type, usable_size)?;
                 if cell.rowid() == Some(rowid) {
                     // Remove this cell by collecting all others and rewriting.
                     let mut remaining_cells: Vec<(i64, Vec<u8>)> = Vec::new();
@@ -1484,7 +1471,8 @@ fn delete_from_subtree(
                         if j == i {
                             continue;
                         }
-                        let (c, _, _) = parse_cell_raw(&data, p as usize, header.page_type, usable_size)?;
+                        let (c, _, _) =
+                            parse_cell_raw(&data, p as usize, header.page_type, usable_size)?;
                         let raw = extract_raw_table_leaf_cell(&data, p as usize)?;
                         remaining_cells.push((c.rowid().unwrap(), raw));
                     }
@@ -1500,7 +1488,8 @@ fn delete_from_subtree(
 
             // Find which child to descend into.
             for &ptr in pointers.iter() {
-                let (cell, _, _) = parse_cell_raw(&data, ptr as usize, header.page_type, usable_size)?;
+                let (cell, _, _) =
+                    parse_cell_raw(&data, ptr as usize, header.page_type, usable_size)?;
                 let key = cell.rowid().unwrap();
                 if rowid <= key {
                     let child = cell.left_child().unwrap();
@@ -1515,7 +1504,9 @@ fn delete_from_subtree(
             }
         }
 
-        _ => Err(RsqliteError::Corrupt("unexpected page type during delete".into())),
+        _ => Err(RsqliteError::Corrupt(
+            "unexpected page type during delete".into(),
+        )),
     }
 }
 
@@ -1531,9 +1522,8 @@ fn read_varint_checked(data: &[u8], offset: usize) -> Result<(u64, usize)> {
             "varint extends beyond page boundary".into(),
         ));
     }
-    varint::try_read_varint(&data[offset..]).ok_or_else(|| {
-        RsqliteError::Corrupt("truncated varint in cell".into())
-    })
+    varint::try_read_varint(&data[offset..])
+        .ok_or_else(|| RsqliteError::Corrupt("truncated varint in cell".into()))
 }
 
 /// Read a signed varint from `data[offset..]`.
@@ -1842,8 +1832,7 @@ mod tests {
         let pointers = read_cell_pointers(&page, 0, &header).unwrap();
 
         let (cell, total_size, overflow) =
-            parse_cell_raw(&page, pointers[0] as usize, header.page_type, USABLE_SIZE)
-                .unwrap();
+            parse_cell_raw(&page, pointers[0] as usize, header.page_type, USABLE_SIZE).unwrap();
 
         assert_eq!(total_size, payload.len());
         assert_eq!(overflow, 0);
@@ -1867,8 +1856,7 @@ mod tests {
         let pointers = read_cell_pointers(&page, 0, &header).unwrap();
 
         let (cell, total_size, overflow) =
-            parse_cell_raw(&page, pointers[0] as usize, header.page_type, USABLE_SIZE)
-                .unwrap();
+            parse_cell_raw(&page, pointers[0] as usize, header.page_type, USABLE_SIZE).unwrap();
 
         assert_eq!(total_size, 0); // no payload
         assert_eq!(overflow, 0);
@@ -1890,8 +1878,7 @@ mod tests {
         let pointers = read_cell_pointers(&page, 0, &header).unwrap();
 
         let (cell, total_size, overflow) =
-            parse_cell_raw(&page, pointers[0] as usize, header.page_type, USABLE_SIZE)
-                .unwrap();
+            parse_cell_raw(&page, pointers[0] as usize, header.page_type, USABLE_SIZE).unwrap();
 
         assert_eq!(total_size, payload.len());
         assert_eq!(overflow, 0);
@@ -1912,8 +1899,7 @@ mod tests {
         let pointers = read_cell_pointers(&page, 0, &header).unwrap();
 
         let (cell, total_size, overflow) =
-            parse_cell_raw(&page, pointers[0] as usize, header.page_type, USABLE_SIZE)
-                .unwrap();
+            parse_cell_raw(&page, pointers[0] as usize, header.page_type, USABLE_SIZE).unwrap();
 
         assert_eq!(total_size, payload.len());
         assert_eq!(overflow, 0);
@@ -1990,12 +1976,8 @@ mod tests {
 
     #[test]
     fn test_multiple_table_leaf_cells() {
-        let cells_data: Vec<(i64, &[u8])> = vec![
-            (1, b"alpha"),
-            (2, b"beta"),
-            (3, b"gamma"),
-            (4, b"delta"),
-        ];
+        let cells_data: Vec<(i64, &[u8])> =
+            vec![(1, b"alpha"), (2, b"beta"), (3, b"gamma"), (4, b"delta")];
         let page = build_table_leaf_page(2, &cells_data);
         let header = BTreePageHeader::parse(&page, 0).unwrap();
         let pointers = read_cell_pointers(&page, 0, &header).unwrap();
@@ -2158,8 +2140,13 @@ mod tests {
         format::write_be_u16(&mut leaf_page.data, header_offset + 8, cell_start as u16);
 
         // Now parse the cell with overflow resolution.
-        let cell = parse_cell(&mut pager, leaf_page_num, cell_start, BTreePageType::TableLeaf)
-            .unwrap();
+        let cell = parse_cell(
+            &mut pager,
+            leaf_page_num,
+            cell_start,
+            BTreePageType::TableLeaf,
+        )
+        .unwrap();
 
         match cell {
             BTreeCell::TableLeaf { rowid, payload } => {
@@ -2179,11 +2166,7 @@ mod tests {
     fn test_cursor_single_leaf_page() {
         let mut pager = Pager::in_memory();
 
-        let cells: Vec<(i64, &[u8])> = vec![
-            (1, b"alpha"),
-            (2, b"beta"),
-            (3, b"gamma"),
-        ];
+        let cells: Vec<(i64, &[u8])> = vec![(1, b"alpha"), (2, b"beta"), (3, b"gamma")];
         let leaf_data = build_table_leaf_page(2, &cells);
 
         // Allocate page 2 and install data.
@@ -2234,16 +2217,8 @@ mod tests {
         //   Leaf 3: rowids 1, 2, 3
         //   Leaf 4: rowids 4, 5, 6
 
-        let leaf3 = build_table_leaf_page(3, &[
-            (1, b"one"),
-            (2, b"two"),
-            (3, b"three"),
-        ]);
-        let leaf4 = build_table_leaf_page(4, &[
-            (4, b"four"),
-            (5, b"five"),
-            (6, b"six"),
-        ]);
+        let leaf3 = build_table_leaf_page(3, &[(1, b"one"), (2, b"two"), (3, b"three")]);
+        let leaf4 = build_table_leaf_page(4, &[(4, b"four"), (5, b"five"), (6, b"six")]);
         // Interior page: left_child=3 with rowid=3, right_child=4
         let interior = build_table_interior_page(2, &[(3, 3)], 4);
 
@@ -2327,11 +2302,7 @@ mod tests {
     fn test_cursor_seek_exact() {
         let mut pager = Pager::in_memory();
 
-        let cells: Vec<(i64, &[u8])> = vec![
-            (10, b"ten"),
-            (20, b"twenty"),
-            (30, b"thirty"),
-        ];
+        let cells: Vec<(i64, &[u8])> = vec![(10, b"ten"), (20, b"twenty"), (30, b"thirty")];
         let leaf = build_table_leaf_page(2, &cells);
         pager.allocate_page().unwrap();
         install_page(&mut pager, 2, leaf);
@@ -2350,11 +2321,7 @@ mod tests {
     fn test_cursor_seek_not_found_positioned_on_successor() {
         let mut pager = Pager::in_memory();
 
-        let cells: Vec<(i64, &[u8])> = vec![
-            (10, b"ten"),
-            (20, b"twenty"),
-            (30, b"thirty"),
-        ];
+        let cells: Vec<(i64, &[u8])> = vec![(10, b"ten"), (20, b"twenty"), (30, b"thirty")];
         let leaf = build_table_leaf_page(2, &cells);
         pager.allocate_page().unwrap();
         install_page(&mut pager, 2, leaf);
@@ -2372,10 +2339,7 @@ mod tests {
     fn test_cursor_seek_past_end() {
         let mut pager = Pager::in_memory();
 
-        let cells: Vec<(i64, &[u8])> = vec![
-            (10, b"ten"),
-            (20, b"twenty"),
-        ];
+        let cells: Vec<(i64, &[u8])> = vec![(10, b"ten"), (20, b"twenty")];
         let leaf = build_table_leaf_page(2, &cells);
         pager.allocate_page().unwrap();
         install_page(&mut pager, 2, leaf);
@@ -2392,10 +2356,7 @@ mod tests {
     fn test_cursor_seek_before_start() {
         let mut pager = Pager::in_memory();
 
-        let cells: Vec<(i64, &[u8])> = vec![
-            (10, b"ten"),
-            (20, b"twenty"),
-        ];
+        let cells: Vec<(i64, &[u8])> = vec![(10, b"ten"), (20, b"twenty")];
         let leaf = build_table_leaf_page(2, &cells);
         pager.allocate_page().unwrap();
         install_page(&mut pager, 2, leaf);

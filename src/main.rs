@@ -137,33 +137,27 @@ fn handle_dot_command(input: &str, db: &mut Database, state: &mut ReplState) {
         ".quit" | ".exit" => {
             std::process::exit(0);
         }
-        ".tables" => {
-            match db.table_names() {
-                Ok(names) => {
-                    if !names.is_empty() {
-                        println!("{}", names.join("  "));
+        ".tables" => match db.table_names() {
+            Ok(names) => {
+                if !names.is_empty() {
+                    println!("{}", names.join("  "));
+                }
+            }
+            Err(e) => eprintln!("Error: {e}"),
+        },
+        ".schema" => match db.schema() {
+            Ok(entries) => {
+                for entry in &entries {
+                    if !arg.is_empty() && !entry.name.eq_ignore_ascii_case(arg) {
+                        continue;
+                    }
+                    if let Some(ref sql) = entry.sql {
+                        println!("{sql};");
                     }
                 }
-                Err(e) => eprintln!("Error: {e}"),
             }
-        }
-        ".schema" => {
-            match db.schema() {
-                Ok(entries) => {
-                    for entry in &entries {
-                        if !arg.is_empty()
-                            && !entry.name.eq_ignore_ascii_case(arg)
-                        {
-                            continue;
-                        }
-                        if let Some(ref sql) = entry.sql {
-                            println!("{sql};");
-                        }
-                    }
-                }
-                Err(e) => eprintln!("Error: {e}"),
-            }
-        }
+            Err(e) => eprintln!("Error: {e}"),
+        },
         ".headers" => match arg.to_lowercase().as_str() {
             "on" => state.headers = true,
             "off" => state.headers = false,
@@ -175,12 +169,39 @@ fn handle_dot_command(input: &str, db: &mut Database, state: &mut ReplState) {
             "line" => state.mode = OutputMode::Line,
             _ => eprintln!("Usage: .mode column|csv|line"),
         },
+        ".read" => {
+            if arg.is_empty() {
+                eprintln!("Usage: .read FILENAME");
+            } else {
+                match std::fs::read_to_string(arg) {
+                    Ok(contents) => {
+                        for stmt_sql in split_statements(&contents) {
+                            let trimmed = stmt_sql.trim();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            match db.execute(trimmed) {
+                                Ok(result) => {
+                                    print_result(&result, state);
+                                }
+                                Err(e) => {
+                                    eprintln!("Error: {e}");
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("Error: cannot open \"{arg}\": {e}"),
+                }
+            }
+        }
         ".help" => {
             println!(".exit                  Exit this program");
             println!(".headers on|off        Turn display of headers on or off");
             println!(".help                  Show this help");
             println!(".mode column|csv|line  Set output mode");
+            println!(".open FILENAME         Close existing database and reopen FILENAME");
             println!(".quit                  Exit this program");
+            println!(".read FILENAME         Execute SQL in FILENAME");
             println!(".schema ?TABLE?        Show the CREATE statements");
             println!(".tables                List names of tables");
         }
@@ -198,7 +219,9 @@ fn handle_dot_command(input: &str, db: &mut Database, state: &mut ReplState) {
             }
         }
         _ => {
-            eprintln!("Error: unknown command or invalid arguments: \"{cmd}\". Enter \".help\" for help");
+            eprintln!(
+                "Error: unknown command or invalid arguments: \"{cmd}\". Enter \".help\" for help"
+            );
         }
     }
 }
@@ -283,10 +306,7 @@ fn print_column_mode(result: &QueryResult, headers: bool) {
         println!("{}", header_parts.join("  "));
 
         // Print separator.
-        let sep_parts: Vec<String> = col_widths
-            .iter()
-            .map(|w| "-".repeat(*w))
-            .collect();
+        let sep_parts: Vec<String> = col_widths.iter().map(|w| "-".repeat(*w)).collect();
         println!("{}", sep_parts.join("  "));
     }
 
@@ -311,11 +331,8 @@ fn print_column_mode(result: &QueryResult, headers: bool) {
 /// Print results in CSV mode.
 fn print_csv_mode(result: &QueryResult, headers: bool) {
     if headers && !result.columns.is_empty() {
-        let header_parts: Vec<String> = result
-            .columns
-            .iter()
-            .map(|c| csv_escape(&c.name))
-            .collect();
+        let header_parts: Vec<String> =
+            result.columns.iter().map(|c| csv_escape(&c.name)).collect();
         println!("{}", header_parts.join(","));
     }
 

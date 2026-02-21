@@ -98,7 +98,7 @@ impl DatabaseHeader {
             raw_page_size
         };
 
-        if page_size < MIN_PAGE_SIZE || page_size > MAX_PAGE_SIZE || !page_size.is_power_of_two() {
+        if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&page_size) || !page_size.is_power_of_two() {
             return Err(RsqliteError::Corrupt(format!(
                 "invalid page size: {page_size}"
             )));
@@ -194,11 +194,21 @@ pub fn read_be_u16(buf: &[u8], offset: usize) -> u16 {
 }
 
 pub fn read_be_u32(buf: &[u8], offset: usize) -> u32 {
-    u32::from_be_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]])
+    u32::from_be_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+    ])
 }
 
 pub fn read_be_i32(buf: &[u8], offset: usize) -> i32 {
-    i32::from_be_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]])
+    i32::from_be_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+    ])
 }
 
 pub fn read_be_u64(buf: &[u8], offset: usize) -> u64 {

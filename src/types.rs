@@ -59,7 +59,10 @@ impl Value {
             Value::Null => None,
             Value::Integer(i) => Some(*i),
             Value::Real(f) => Some(*f as i64),
-            Value::Text(s) => s.parse::<i64>().ok().or_else(|| s.parse::<f64>().ok().map(|f| f as i64)),
+            Value::Text(s) => s
+                .parse::<i64>()
+                .ok()
+                .or_else(|| s.parse::<f64>().ok().map(|f| f as i64)),
             Value::Blob(_) => Some(0),
         }
     }

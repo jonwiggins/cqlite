@@ -491,9 +491,7 @@ impl<'a> Tokenizer<'a> {
         let start = self.pos;
 
         // Hex literal: 0x...
-        if self.peek() == Some(b'0')
-            && matches!(self.peek_at(1), Some(b'x') | Some(b'X'))
-        {
+        if self.peek() == Some(b'0') && matches!(self.peek_at(1), Some(b'x') | Some(b'X')) {
             self.advance_by(2); // consume 0x
             let hex_start = self.pos;
             while let Some(b) = self.peek() {
@@ -644,15 +642,13 @@ impl<'a> Tokenizer<'a> {
                     hex_str.push(b as char);
                 }
                 Some(b) => {
-                    return self.error(format!(
-                        "invalid character '{}' in blob literal",
-                        b as char
-                    ));
+                    return self
+                        .error(format!("invalid character '{}' in blob literal", b as char));
                 }
             }
         }
 
-        if hex_str.len() % 2 != 0 {
+        if !hex_str.len().is_multiple_of(2) {
             return self.error("blob literal must contain an even number of hex digits");
         }
 
@@ -977,12 +973,10 @@ impl<'a> Tokenizer<'a> {
                 }
             }
 
-            _ => {
-                self.error(format!(
-                    "unexpected character '{}'",
-                    self.remaining().chars().next().unwrap()
-                ))
-            }
+            _ => self.error(format!(
+                "unexpected character '{}'",
+                self.remaining().chars().next().unwrap()
+            )),
         }
     }
 }
@@ -1134,12 +1128,7 @@ mod tests {
             ("WITH", Token::With),
         ];
         for (input, expected) in cases {
-            assert_eq!(
-                tok1(input),
-                expected,
-                "keyword mismatch for {:?}",
-                input
-            );
+            assert_eq!(tok1(input), expected, "keyword mismatch for {:?}", input);
             // Also verify lowercase
             assert_eq!(
                 tok1(&input.to_lowercase()),
@@ -1166,18 +1155,12 @@ mod tests {
 
     #[test]
     fn string_literal_escaped_quote() {
-        assert_eq!(
-            tok1("'it''s'"),
-            Token::StringLiteral("it's".into())
-        );
+        assert_eq!(tok1("'it''s'"), Token::StringLiteral("it's".into()));
     }
 
     #[test]
     fn string_literal_double_escaped() {
-        assert_eq!(
-            tok1("'a''''b'"),
-            Token::StringLiteral("a''b".into())
-        );
+        assert_eq!(tok1("'a''''b'"), Token::StringLiteral("a''b".into()));
     }
 
     #[test]
@@ -1253,10 +1236,7 @@ mod tests {
 
     #[test]
     fn blob_literal_lowercase_x() {
-        assert_eq!(
-            tok1("x'FF00'"),
-            Token::BlobLiteral(vec![0xFF, 0x00])
-        );
+        assert_eq!(tok1("x'FF00'"), Token::BlobLiteral(vec![0xFF, 0x00]));
     }
 
     #[test]
@@ -1696,10 +1676,7 @@ mod tests {
         // The tokenizer produces Minus and IntegerLiteral separately;
         // the parser is responsible for combining them.
         let tokens = tok("-42");
-        assert_eq!(
-            tokens,
-            vec![Token::Minus, Token::IntegerLiteral(42)]
-        );
+        assert_eq!(tokens, vec![Token::Minus, Token::IntegerLiteral(42)]);
     }
 
     #[test]
@@ -2095,10 +2072,7 @@ mod tests {
     #[test]
     fn on_conflict_clause() {
         let tokens = tok("ON CONFLICT ABORT");
-        assert_eq!(
-            tokens,
-            vec![Token::On, Token::Conflict, Token::Abort]
-        );
+        assert_eq!(tokens, vec![Token::On, Token::Conflict, Token::Abort]);
     }
 
     #[test]

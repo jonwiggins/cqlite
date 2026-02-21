@@ -22,7 +22,9 @@ pub fn decode_record(buf: &[u8]) -> Result<Vec<Value>> {
     let header_size = header_size as usize;
 
     if header_size > buf.len() {
-        return Err(RsqliteError::Corrupt("record header size exceeds buffer".into()));
+        return Err(RsqliteError::Corrupt(
+            "record header size exceeds buffer".into(),
+        ));
     }
 
     // Read serial types from the header.
@@ -129,11 +131,7 @@ fn decode_value(buf: &[u8], serial_type: u64) -> Result<(Value, usize)> {
             // Sign-extend from 24 bits.
             let v = ((buf[0] as i32) << 16) | ((buf[1] as i32) << 8) | (buf[2] as i32);
             // Sign-extend: if bit 23 is set, extend.
-            let v = if v & 0x800000 != 0 {
-                v | !0xFFFFFF
-            } else {
-                v
-            };
+            let v = if v & 0x800000 != 0 { v | !0xFFFFFF } else { v };
             Ok((Value::Integer(v as i64), 3))
         }
         4 => {
@@ -231,22 +229,22 @@ fn encode_integer(i: i64) -> (u64, Vec<u8>) {
     if i == 1 {
         return (9, Vec::new());
     }
-    if i >= -128 && i <= 127 {
+    if (-128..=127).contains(&i) {
         return (1, vec![i as u8]);
     }
-    if i >= -32768 && i <= 32767 {
+    if (-32768..=32767).contains(&i) {
         let bytes = (i as i16).to_be_bytes();
         return (2, bytes.to_vec());
     }
-    if i >= -8388608 && i <= 8388607 {
+    if (-8388608..=8388607).contains(&i) {
         let v = i as i32;
         return (3, vec![(v >> 16) as u8, (v >> 8) as u8, v as u8]);
     }
-    if i >= -2147483648 && i <= 2147483647 {
+    if (-2147483648..=2147483647).contains(&i) {
         let bytes = (i as i32).to_be_bytes();
         return (4, bytes.to_vec());
     }
-    if i >= -140737488355328 && i <= 140737488355327 {
+    if (-140737488355328..=140737488355327).contains(&i) {
         // 6 bytes: 48-bit signed integer.
         let bytes = i.to_be_bytes();
         return (5, bytes[2..8].to_vec());

@@ -62,7 +62,10 @@ impl Pager {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
 
-        let file_exists = path.exists() && std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false);
+        let file_exists = path.exists()
+            && std::fs::metadata(&path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false);
 
         let mut file = OpenOptions::new()
             .read(true)
@@ -382,12 +385,11 @@ impl Pager {
     fn maybe_evict(&mut self) -> Result<()> {
         while self.cache.len() >= self.cache_limit {
             // Find the LRU page that isn't dirty.
-            if let Some(pos) = self.lru.iter().position(|&p| {
-                self.cache
-                    .get(&p)
-                    .map(|page| !page.dirty)
-                    .unwrap_or(true)
-            }) {
+            if let Some(pos) = self
+                .lru
+                .iter()
+                .position(|&p| self.cache.get(&p).map(|page| !page.dirty).unwrap_or(true))
+            {
                 let evict = self.lru.remove(pos);
                 self.cache.remove(&evict);
             } else {

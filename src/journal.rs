@@ -13,6 +13,9 @@
 //       - page_size bytes of original page data
 
 use std::collections::HashSet;
+
+/// Result of a journal rollback: saved pages and optional original page count.
+type RollbackResult = (Vec<(u32, Vec<u8>)>, Option<u32>);
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -137,12 +140,13 @@ impl Journal {
         }
 
         // Always store in memory for rollback support (needed for in-memory dbs).
-        self.mem_pages.push((page_num, data[..self.page_size].to_vec()));
+        self.mem_pages
+            .push((page_num, data[..self.page_size].to_vec()));
 
         if let Some(ref mut file) = self.file {
             // Seek to the end and write the page entry.
-            let offset = JOURNAL_HEADER_SIZE as u64
-                + self.page_count as u64 * (4 + self.page_size as u64);
+            let offset =
+                JOURNAL_HEADER_SIZE as u64 + self.page_count as u64 * (4 + self.page_size as u64);
             file.seek(SeekFrom::Start(offset))?;
 
             // Write page number (big-endian u32).
@@ -189,7 +193,7 @@ impl Journal {
     /// Rollback the transaction: restore pages from journal, then delete it.
     /// Returns the list of (page_number, original_data) pairs to restore,
     /// and the saved page count to restore.
-    pub fn rollback(&mut self) -> Result<(Vec<(u32, Vec<u8>)>, Option<u32>)> {
+    pub fn rollback(&mut self) -> Result<RollbackResult> {
         if !self.active {
             return Ok((vec![], None));
         }
@@ -317,9 +321,7 @@ impl Journal {
 
         if stored_page_size != page_size {
             fs::remove_file(&jp).ok();
-            return Err(RsqliteError::Corrupt(
-                "journal page size mismatch".into(),
-            ));
+            return Err(RsqliteError::Corrupt("journal page size mismatch".into()));
         }
 
         let mut pages = Vec::with_capacity(page_count as usize);

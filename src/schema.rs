@@ -64,17 +64,14 @@ fn schema_entry_from_values(values: &[Value]) -> Result<SchemaEntry> {
         )));
     }
 
-    let entry_type = value_to_string(&values[0]).ok_or_else(|| {
-        RsqliteError::Corrupt("sqlite_master.type is not text".into())
-    })?;
+    let entry_type = value_to_string(&values[0])
+        .ok_or_else(|| RsqliteError::Corrupt("sqlite_master.type is not text".into()))?;
 
-    let name = value_to_string(&values[1]).ok_or_else(|| {
-        RsqliteError::Corrupt("sqlite_master.name is not text".into())
-    })?;
+    let name = value_to_string(&values[1])
+        .ok_or_else(|| RsqliteError::Corrupt("sqlite_master.name is not text".into()))?;
 
-    let tbl_name = value_to_string(&values[2]).ok_or_else(|| {
-        RsqliteError::Corrupt("sqlite_master.tbl_name is not text".into())
-    })?;
+    let tbl_name = value_to_string(&values[2])
+        .ok_or_else(|| RsqliteError::Corrupt("sqlite_master.tbl_name is not text".into()))?;
 
     let rootpage = match &values[3] {
         Value::Integer(i) => *i,
@@ -120,9 +117,9 @@ fn value_to_string(value: &Value) -> Option<String> {
 /// Only returns entries where `entry_type` is "table".
 pub fn find_table<'a>(schema: &'a [SchemaEntry], name: &str) -> Option<&'a SchemaEntry> {
     let name_lower = name.to_lowercase();
-    schema.iter().find(|entry| {
-        entry.entry_type == "table" && entry.name.to_lowercase() == name_lower
-    })
+    schema
+        .iter()
+        .find(|entry| entry.entry_type == "table" && entry.name.to_lowercase() == name_lower)
 }
 
 #[cfg(test)]
@@ -253,10 +250,7 @@ mod tests {
 
     #[test]
     fn test_schema_entry_too_few_columns() {
-        let values = vec![
-            Value::Text("table".into()),
-            Value::Text("users".into()),
-        ];
+        let values = vec![Value::Text("table".into()), Value::Text("users".into())];
         let result = schema_entry_from_values(&values);
         assert!(result.is_err());
     }
@@ -331,10 +325,7 @@ mod tests {
         let record1 = build_master_record("table", "users", "users", 2, Some(table_sql));
         let record2 = build_master_record("index", "idx_email", "users", 3, Some(index_sql));
 
-        let page_data = build_page1_leaf(&[
-            (1, &record1),
-            (2, &record2),
-        ]);
+        let page_data = build_page1_leaf(&[(1, &record1), (2, &record2)]);
         install_page1(&mut pager, page_data);
 
         let schema = read_schema(&mut pager).unwrap();
@@ -371,10 +362,7 @@ mod tests {
         // Autoindex has NULL sql.
         let record2 = build_master_record("index", "sqlite_autoindex_t_1", "t", 3, None);
 
-        let page_data = build_page1_leaf(&[
-            (1, &record1),
-            (2, &record2),
-        ]);
+        let page_data = build_page1_leaf(&[(1, &record1), (2, &record2)]);
         install_page1(&mut pager, page_data);
 
         let schema = read_schema(&mut pager).unwrap();
@@ -394,10 +382,7 @@ mod tests {
         let record1 = build_master_record("table", "orders", "orders", 2, Some(sql1));
         let record2 = build_master_record("table", "products", "products", 3, Some(sql2));
 
-        let page_data = build_page1_leaf(&[
-            (1, &record1),
-            (2, &record2),
-        ]);
+        let page_data = build_page1_leaf(&[(1, &record1), (2, &record2)]);
         install_page1(&mut pager, page_data);
 
         let schema = read_schema(&mut pager).unwrap();

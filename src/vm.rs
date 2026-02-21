@@ -13,6 +13,9 @@ use crate::pager::Pager;
 use crate::record;
 use crate::types::Value;
 
+/// A group is a key (group-by values) and its matching rows.
+type GroupEntry<'a> = (Vec<Value>, Vec<&'a (i64, Vec<Value>)>);
+
 /// A row is a vector of named columns with their values.
 #[derive(Debug, Clone)]
 pub struct Row {
@@ -26,6 +29,15 @@ pub struct ColumnInfo {
     pub table: Option<String>,
 }
 
+/// Per-column constraint information extracted from CREATE TABLE.
+#[derive(Debug, Clone, Default)]
+pub struct ColumnConstraints {
+    /// Column must not be NULL.
+    pub not_null: bool,
+    /// Default value expression (already evaluated to a constant).
+    pub default_value: Option<Value>,
+}
+
 /// Schema information for a table, used during query execution.
 #[derive(Debug, Clone)]
 pub struct TableSchema {
@@ -36,6 +48,8 @@ pub struct TableSchema {
     /// When set, this column's value is not stored in the record payload but
     /// is instead the rowid of the B-tree entry.
     pub rowid_column: Option<usize>,
+    /// Per-column constraints (parallel to `columns`).
+    pub column_constraints: Vec<ColumnConstraints>,
 }
 
 /// Result of executing a query.
@@ -85,17 +99,13 @@ pub fn execute_select(
                     (name.as_str(), alias.as_deref().unwrap_or(name.as_str()))
                 }
                 crate::ast::TableRef::Subquery { .. } => {
-                    return Err(RsqliteError::NotImplemented(
-                        "subqueries in FROM".into(),
-                    ));
+                    return Err(RsqliteError::NotImplemented("subqueries in FROM".into()));
                 }
             };
             let schema = tables
                 .iter()
                 .find(|t| t.name.eq_ignore_ascii_case(table_name))
-                .ok_or_else(|| {
-                    RsqliteError::Runtime(format!("no such table: {table_name}"))
-                })?;
+                .ok_or_else(|| RsqliteError::Runtime(format!("no such table: {table_name}")))?;
             (Some(schema), alias.to_string())
         }
         None => (None, String::new()),
@@ -134,18 +144,12 @@ pub fn execute_select(
                 crate::ast::TableRef::Table { name, alias } => {
                     (name.as_str(), alias.as_deref().unwrap_or(name.as_str()))
                 }
-                _ => {
-                    return Err(RsqliteError::NotImplemented(
-                        "subquery in JOIN".into(),
-                    ))
-                }
+                _ => return Err(RsqliteError::NotImplemented("subquery in JOIN".into())),
             };
             let right_schema = tables
                 .iter()
                 .find(|t| t.name.eq_ignore_ascii_case(right_name))
-                .ok_or_else(|| {
-                    RsqliteError::Runtime(format!("no such table: {right_name}"))
-                })?;
+                .ok_or_else(|| RsqliteError::Runtime(format!("no such table: {right_name}")))?;
 
             let right_rows = scan_table(pager, right_schema)?;
 
@@ -217,13 +221,8 @@ pub fn execute_select(
                     // Check join condition.
                     let passes = match &join.constraint {
                         Some(JoinConstraint::On(expr)) => {
-                            let result = eval_expr(
-                                expr,
-                                &all_columns,
-                                &combined_values,
-                                *left_rowid,
-                                None,
-                            )?;
+                            let result =
+                                eval_expr(expr, &all_columns, &combined_values, *left_rowid, None)?;
                             result.is_truthy()
                         }
                         Some(JoinConstraint::Using(_)) => {
@@ -267,9 +266,7 @@ pub fn execute_select(
             // No FROM clause: produce a single synthetic row for expression evaluation.
             raw_rows.push((0, vec![]));
         }
-        let col_names: Vec<String> = table_schema
-            .map(|s| s.columns.clone())
-            .unwrap_or_default();
+        let col_names: Vec<String> = table_schema.map(|s| s.columns.clone()).unwrap_or_default();
         let tname = table_schema.map(|s| s.name.as_str());
         (col_names, raw_rows, tname)
     };
@@ -306,7 +303,7 @@ pub fn execute_select(
                     .map(|item| {
                         Ok(crate::ast::OrderByItem {
                             expr: resolve_subqueries(&item.expr, pager, tables)?,
-                            direction: item.direction.clone(),
+                            direction: item.direction,
                         })
                     })
                     .collect::<Result<_>>()?,
@@ -335,30 +332,29 @@ pub fn execute_select(
     }
 
     // Handle GROUP BY and aggregates.
-    let (result_columns, result_rows, filtered_rows) = if stmt.group_by.is_some()
-        || has_aggregate(&resolved_columns)
-    {
-        let (cols, rows) = execute_group_by(
-            &resolved_columns,
-            &stmt.group_by,
-            &resolved_having,
-            &column_names,
-            &filtered_rows,
-            table_name,
-        )?;
-        // For ORDER BY after GROUP BY, we need the grouped "filtered_rows" equivalent.
-        // Create synthetic filtered rows from the result for ORDER BY.
-        let synth_rows: Vec<(i64, Vec<Value>)> = rows
-            .iter()
-            .enumerate()
-            .map(|(i, r)| (i as i64, r.values.clone()))
-            .collect();
-        (cols, rows, synth_rows)
-    } else {
-        let (cols, rows) =
-            project_columns(&resolved_columns, &column_names, &filtered_rows, table_name)?;
-        (cols, rows, filtered_rows)
-    };
+    let (result_columns, result_rows, filtered_rows) =
+        if stmt.group_by.is_some() || has_aggregate(&resolved_columns) {
+            let (cols, rows) = execute_group_by(
+                &resolved_columns,
+                &stmt.group_by,
+                &resolved_having,
+                &column_names,
+                &filtered_rows,
+                table_name,
+            )?;
+            // For ORDER BY after GROUP BY, we need the grouped "filtered_rows" equivalent.
+            // Create synthetic filtered rows from the result for ORDER BY.
+            let synth_rows: Vec<(i64, Vec<Value>)> = rows
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (i as i64, r.values.clone()))
+                .collect();
+            (cols, rows, synth_rows)
+        } else {
+            let (cols, rows) =
+                project_columns(&resolved_columns, &column_names, &filtered_rows, table_name)?;
+            (cols, rows, filtered_rows)
+        };
 
     // Apply ORDER BY.
     let mut result_rows = result_rows;
@@ -424,21 +420,25 @@ pub fn execute_select(
 
     // Apply LIMIT and OFFSET.
     if let Some(ref limit_clause) = stmt.limit {
-        let limit_val = match &limit_clause.limit {
-            Expr::Literal(LiteralValue::Integer(n)) => *n as usize,
-            _ => {
-                return Err(RsqliteError::NotImplemented(
-                    "non-literal LIMIT".into(),
-                ))
+        let limit_val = match eval_expr(&limit_clause.limit, &[], &[], 0, None)? {
+            Value::Integer(n) => n as usize,
+            Value::Null => usize::MAX, // NULL limit means no limit
+            other => {
+                return Err(RsqliteError::Runtime(format!(
+                    "LIMIT must evaluate to an integer, got: {other}"
+                )))
             }
         };
         let offset_val = match &limit_clause.offset {
-            Some(Expr::Literal(LiteralValue::Integer(n))) => *n as usize,
-            Some(_) => {
-                return Err(RsqliteError::NotImplemented(
-                    "non-literal OFFSET".into(),
-                ))
-            }
+            Some(expr) => match eval_expr(expr, &[], &[], 0, None)? {
+                Value::Integer(n) => n as usize,
+                Value::Null => 0,
+                other => {
+                    return Err(RsqliteError::Runtime(format!(
+                        "OFFSET must evaluate to an integer, got: {other}"
+                    )))
+                }
+            },
             None => 0,
         };
         let start = offset_val.min(result_rows.len());
@@ -446,9 +446,63 @@ pub fn execute_select(
         result_rows = result_rows[start..end].to_vec();
     }
 
+    // Handle compound operations (UNION, UNION ALL, INTERSECT, EXCEPT).
+    if !stmt.compound.is_empty() {
+        for compound in &stmt.compound {
+            let rhs_result = execute_select(pager, &compound.select, tables)?;
+            match compound.op {
+                crate::ast::CompoundOp::UnionAll => {
+                    result_rows.extend(rhs_result.rows);
+                }
+                crate::ast::CompoundOp::Union => {
+                    // UNION = UNION ALL + dedup.
+                    for row in rhs_result.rows {
+                        if !result_rows
+                            .iter()
+                            .any(|r| rows_equal(&r.values, &row.values))
+                        {
+                            result_rows.push(row);
+                        }
+                    }
+                }
+                crate::ast::CompoundOp::Intersect => {
+                    result_rows.retain(|row| {
+                        rhs_result
+                            .rows
+                            .iter()
+                            .any(|r| rows_equal(&r.values, &row.values))
+                    });
+                }
+                crate::ast::CompoundOp::Except => {
+                    result_rows.retain(|row| {
+                        !rhs_result
+                            .rows
+                            .iter()
+                            .any(|r| rows_equal(&r.values, &row.values))
+                    });
+                }
+            }
+        }
+    }
+
     Ok(QueryResult {
         columns: result_columns,
         rows: result_rows,
+    })
+}
+
+/// Check if two rows have the same values (for UNION dedup).
+fn rows_equal(a: &[Value], b: &[Value]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).all(|(va, vb)| match (va, vb) {
+        (Value::Null, Value::Null) => true,
+        (Value::Integer(a), Value::Integer(b)) => a == b,
+        (Value::Real(a), Value::Real(b)) => a == b,
+        (Value::Text(a), Value::Text(b)) => a == b,
+        (Value::Blob(a), Value::Blob(b)) => a == b,
+        _ => false,
     })
 }
 
@@ -464,9 +518,7 @@ fn has_aggregate(columns: &[ResultColumn]) -> bool {
 fn expr_has_aggregate(expr: &Expr) -> bool {
     match expr {
         Expr::FunctionCall { name, .. } => is_aggregate_fn(name),
-        Expr::BinaryOp { left, right, .. } => {
-            expr_has_aggregate(left) || expr_has_aggregate(right)
-        }
+        Expr::BinaryOp { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
         Expr::UnaryOp { operand, .. } => expr_has_aggregate(operand),
         Expr::Parenthesized(inner) => expr_has_aggregate(inner),
         Expr::Case {
@@ -502,10 +554,8 @@ fn execute_group_by(
     table_name: Option<&str>,
 ) -> Result<(Vec<ColumnInfo>, Vec<Row>)> {
     // Group rows by the GROUP BY key expressions.
-    let groups: Vec<(Vec<Value>, Vec<&(i64, Vec<Value>)>)> = if let Some(ref group_exprs) =
-        group_by
-    {
-        let mut group_map: Vec<(Vec<Value>, Vec<&(i64, Vec<Value>)>)> = Vec::new();
+    let groups: Vec<GroupEntry<'_>> = if let Some(ref group_exprs) = group_by {
+        let mut group_map: Vec<GroupEntry<'_>> = Vec::new();
 
         for row in rows {
             let key: Vec<Value> = group_exprs
@@ -560,10 +610,7 @@ fn execute_group_by(
             }
             ResultColumn::Expr { expr, alias } => {
                 let name = alias.clone().unwrap_or_else(|| expr_display_name(expr));
-                col_infos.push(ColumnInfo {
-                    name,
-                    table: None,
-                });
+                col_infos.push(ColumnInfo { name, table: None });
             }
         }
     }
@@ -600,8 +647,7 @@ fn execute_group_by(
                     }
                 }
                 ResultColumn::Expr { expr, .. } => {
-                    let val =
-                        eval_aggregate_expr(expr, column_names, group_rows, table_name)?;
+                    let val = eval_aggregate_expr(expr, column_names, group_rows, table_name)?;
                     row_values.push(val);
                 }
             }
@@ -616,9 +662,7 @@ fn execute_group_by(
             }
         }
 
-        result_rows.push(Row {
-            values: row_values,
-        });
+        result_rows.push(Row { values: row_values });
     }
 
     Ok((col_infos, result_rows))
@@ -663,7 +707,10 @@ fn eval_aggregate_function(
                     // COUNT(*) counts all rows including NULLs.
                     Ok(Value::Integer(group_rows.len() as i64))
                 }
-                FunctionArgs::Exprs { args: exprs, distinct } => {
+                FunctionArgs::Exprs {
+                    args: exprs,
+                    distinct,
+                } => {
                     if exprs.is_empty() {
                         return Ok(Value::Integer(group_rows.len() as i64));
                     }
@@ -674,8 +721,7 @@ fn eval_aggregate_function(
                             let val = eval_expr(expr, column_names, &row.1, row.0, table_name)?;
                             if !val.is_null() {
                                 let already = seen.iter().any(|s| {
-                                    crate::types::sqlite_cmp(s, &val)
-                                        == std::cmp::Ordering::Equal
+                                    crate::types::sqlite_cmp(s, &val) == std::cmp::Ordering::Equal
                                 });
                                 if !already {
                                     seen.push(val);
@@ -832,42 +878,40 @@ fn eval_aggregate_function(
 
             Ok(max.unwrap_or(Value::Null))
         }
-        "GROUP_CONCAT" => {
-            match args {
-                FunctionArgs::Wildcard => Ok(Value::Null),
-                FunctionArgs::Exprs { args: exprs, .. } => {
-                    if exprs.is_empty() {
-                        return Ok(Value::Null);
-                    }
-                    let expr = &exprs[0];
-                    let separator = if exprs.len() > 1 {
-                        if let Some(first) = group_rows.first() {
-                            eval_expr(&exprs[1], column_names, &first.1, first.0, table_name)?
-                                .to_text()
-                                .unwrap_or_else(|| ",".to_string())
-                        } else {
-                            ",".to_string()
-                        }
+        "GROUP_CONCAT" => match args {
+            FunctionArgs::Wildcard => Ok(Value::Null),
+            FunctionArgs::Exprs { args: exprs, .. } => {
+                if exprs.is_empty() {
+                    return Ok(Value::Null);
+                }
+                let expr = &exprs[0];
+                let separator = if exprs.len() > 1 {
+                    if let Some(first) = group_rows.first() {
+                        eval_expr(&exprs[1], column_names, &first.1, first.0, table_name)?
+                            .to_text()
+                            .unwrap_or_else(|| ",".to_string())
                     } else {
                         ",".to_string()
-                    };
-
-                    let mut parts = Vec::new();
-                    for row in group_rows {
-                        let val = eval_expr(expr, column_names, &row.1, row.0, table_name)?;
-                        if !val.is_null() {
-                            parts.push(val.to_text().unwrap_or_default());
-                        }
                     }
+                } else {
+                    ",".to_string()
+                };
 
-                    if parts.is_empty() {
-                        Ok(Value::Null)
-                    } else {
-                        Ok(Value::Text(parts.join(&separator)))
+                let mut parts = Vec::new();
+                for row in group_rows {
+                    let val = eval_expr(expr, column_names, &row.1, row.0, table_name)?;
+                    if !val.is_null() {
+                        parts.push(val.to_text().unwrap_or_default());
                     }
                 }
+
+                if parts.is_empty() {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::Text(parts.join(&separator)))
+                }
             }
-        }
+        },
         _ => Err(RsqliteError::Runtime(format!(
             "unknown aggregate function: {name}"
         ))),
@@ -922,9 +966,7 @@ fn project_columns(
                 }
             }
             ResultColumn::TableAllColumns(tname) => {
-                if table_name.is_some()
-                    && table_name.unwrap().eq_ignore_ascii_case(tname)
-                {
+                if table_name.is_some() && table_name.unwrap().eq_ignore_ascii_case(tname) {
                     // Single-table context.
                     for (i, &name) in column_names.iter().enumerate() {
                         col_infos.push(ColumnInfo {
@@ -938,7 +980,10 @@ fn project_columns(
                     let prefix = format!("{}.", tname);
                     let mut found = false;
                     for (i, &name) in column_names.iter().enumerate() {
-                        if name.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase()) {
+                        if name
+                            .to_ascii_lowercase()
+                            .starts_with(&prefix.to_ascii_lowercase())
+                        {
                             let bare = &name[prefix.len()..];
                             col_infos.push(ColumnInfo {
                                 name: bare.to_string(),
@@ -949,18 +994,13 @@ fn project_columns(
                         }
                     }
                     if !found {
-                        return Err(RsqliteError::Runtime(format!(
-                            "no such table: {tname}"
-                        )));
+                        return Err(RsqliteError::Runtime(format!("no such table: {tname}")));
                     }
                 }
             }
             ResultColumn::Expr { expr, alias } => {
                 let name = alias.clone().unwrap_or_else(|| expr_display_name(expr));
-                col_infos.push(ColumnInfo {
-                    name,
-                    table: None,
-                });
+                col_infos.push(ColumnInfo { name, table: None });
                 projections.push(ColumnProjection::Expr(expr.clone()));
             }
         }
@@ -982,15 +1022,12 @@ fn project_columns(
                     row_values.push(val);
                 }
                 ColumnProjection::Expr(expr) => {
-                    let val =
-                        eval_expr(expr, column_names, values, *rowid, table_name)?;
+                    let val = eval_expr(expr, column_names, values, *rowid, table_name)?;
                     row_values.push(val);
                 }
             }
         }
-        result_rows.push(Row {
-            values: row_values,
-        });
+        result_rows.push(Row { values: row_values });
     }
 
     Ok((col_infos, result_rows))
@@ -1099,9 +1136,7 @@ pub fn eval_expr(
             LiteralValue::Null => Value::Null,
             LiteralValue::CurrentTime
             | LiteralValue::CurrentDate
-            | LiteralValue::CurrentTimestamp => {
-                Value::Text("(not implemented)".into())
-            }
+            | LiteralValue::CurrentTimestamp => Value::Text("(not implemented)".into()),
         }),
 
         Expr::ColumnRef { table, column } => {
@@ -1217,9 +1252,9 @@ pub fn eval_expr(
                     let result = if *negated { !found } else { found };
                     Ok(Value::Integer(if result { 1 } else { 0 }))
                 }
-                crate::ast::InList::Subquery(_) => Err(RsqliteError::NotImplemented(
-                    "IN subquery".into(),
-                )),
+                crate::ast::InList::Subquery(_) => {
+                    Err(RsqliteError::NotImplemented("IN subquery".into()))
+                }
             }
         }
 
@@ -1253,9 +1288,7 @@ pub fn eval_expr(
             eval_function(name, args, column_names, values, rowid, table_name)
         }
 
-        Expr::Parenthesized(inner) => {
-            eval_expr(inner, column_names, values, rowid, table_name)
-        }
+        Expr::Parenthesized(inner) => eval_expr(inner, column_names, values, rowid, table_name),
 
         Expr::Cast { expr, type_name } => {
             let val = eval_expr(expr, column_names, values, rowid, table_name)?;
@@ -1277,7 +1310,10 @@ pub fn eval_expr(
                     }
                     Value::Blob(_) => Ok(Value::Integer(0)),
                 }
-            } else if upper_type.contains("REAL") || upper_type.contains("FLOA") || upper_type.contains("DOUB") {
+            } else if upper_type.contains("REAL")
+                || upper_type.contains("FLOA")
+                || upper_type.contains("DOUB")
+            {
                 match &val {
                     Value::Null => Ok(Value::Null),
                     Value::Real(_) => Ok(val),
@@ -1291,7 +1327,11 @@ pub fn eval_expr(
                     }
                     Value::Blob(_) => Ok(Value::Real(0.0)),
                 }
-            } else if upper_type.contains("TEXT") || upper_type.contains("CHAR") || upper_type.contains("CLOB") || upper_type.contains("VAR") {
+            } else if upper_type.contains("TEXT")
+                || upper_type.contains("CHAR")
+                || upper_type.contains("CLOB")
+                || upper_type.contains("VAR")
+            {
                 match &val {
                     Value::Null => Ok(Value::Null),
                     Value::Text(_) => Ok(val),
@@ -1321,18 +1361,14 @@ pub fn eval_expr(
             if let Some(base) = operand {
                 let base_val = eval_expr(base, column_names, values, rowid, table_name)?;
                 for (when_expr, then_expr) in when_clauses {
-                    let when_val =
-                        eval_expr(when_expr, column_names, values, rowid, table_name)?;
-                    if crate::types::sqlite_cmp(&base_val, &when_val)
-                        == std::cmp::Ordering::Equal
-                    {
+                    let when_val = eval_expr(when_expr, column_names, values, rowid, table_name)?;
+                    if crate::types::sqlite_cmp(&base_val, &when_val) == std::cmp::Ordering::Equal {
                         return eval_expr(then_expr, column_names, values, rowid, table_name);
                     }
                 }
             } else {
                 for (when_expr, then_expr) in when_clauses {
-                    let when_val =
-                        eval_expr(when_expr, column_names, values, rowid, table_name)?;
+                    let when_val = eval_expr(when_expr, column_names, values, rowid, table_name)?;
                     if when_val.is_truthy() {
                         return eval_expr(then_expr, column_names, values, rowid, table_name);
                     }
@@ -1359,9 +1395,7 @@ pub fn eval_expr(
 /// Evaluate a binary operation on two values.
 fn eval_binary_op(op: &BinaryOp, lv: &Value, rv: &Value) -> Result<Value> {
     // NULL propagation for most operators.
-    if (lv.is_null() || rv.is_null())
-        && !matches!(op, BinaryOp::Is | BinaryOp::IsNot)
-    {
+    if (lv.is_null() || rv.is_null()) && !matches!(op, BinaryOp::Is | BinaryOp::IsNot) {
         return Ok(Value::Null);
     }
 
@@ -1539,7 +1573,7 @@ fn eval_function(
                 Value::Text(s) => Ok(Value::Integer(s.len() as i64)),
                 Value::Blob(b) => Ok(Value::Integer(b.len() as i64)),
                 other => Ok(Value::Integer(
-                    other.to_text().unwrap_or_default().len() as i64,
+                    other.to_text().unwrap_or_default().len() as i64
                 )),
             }
         }
@@ -1550,7 +1584,9 @@ fn eval_function(
             match &arg_values[0] {
                 Value::Null => Ok(Value::Null),
                 Value::Text(s) => Ok(Value::Text(s.to_uppercase())),
-                other => Ok(Value::Text(other.to_text().unwrap_or_default().to_uppercase())),
+                other => Ok(Value::Text(
+                    other.to_text().unwrap_or_default().to_uppercase(),
+                )),
             }
         }
         "LOWER" => {
@@ -1560,7 +1596,9 @@ fn eval_function(
             match &arg_values[0] {
                 Value::Null => Ok(Value::Null),
                 Value::Text(s) => Ok(Value::Text(s.to_lowercase())),
-                other => Ok(Value::Text(other.to_text().unwrap_or_default().to_lowercase())),
+                other => Ok(Value::Text(
+                    other.to_text().unwrap_or_default().to_lowercase(),
+                )),
             }
         }
         "ABS" => {
@@ -1602,8 +1640,7 @@ fn eval_function(
             if arg_values.len() != 2 {
                 return Err(RsqliteError::Runtime("nullif() takes 2 arguments".into()));
             }
-            if crate::types::sqlite_cmp(&arg_values[0], &arg_values[1])
-                == std::cmp::Ordering::Equal
+            if crate::types::sqlite_cmp(&arg_values[0], &arg_values[1]) == std::cmp::Ordering::Equal
             {
                 Ok(Value::Null)
             } else {
@@ -1697,7 +1734,9 @@ fn eval_function(
             match &arg_values[0] {
                 Value::Null => Ok(Value::Null),
                 Value::Text(s) => Ok(Value::Text(s.trim().to_string())),
-                other => Ok(Value::Text(other.to_text().unwrap_or_default().trim().to_string())),
+                other => Ok(Value::Text(
+                    other.to_text().unwrap_or_default().trim().to_string(),
+                )),
             }
         }
         "LTRIM" => {
@@ -1906,9 +1945,7 @@ fn eval_function(
                         }
                         's' => {
                             if arg_idx < arg_values.len() {
-                                result.push_str(
-                                    &arg_values[arg_idx].to_text().unwrap_or_default(),
-                                );
+                                result.push_str(&arg_values[arg_idx].to_text().unwrap_or_default());
                                 arg_idx += 1;
                             }
                             i += 2;
@@ -1933,19 +1970,13 @@ fn eval_function(
             // Stub: return 0 for now.
             Ok(Value::Integer(0))
         }
-        _ => Err(RsqliteError::Runtime(format!(
-            "no such function: {name}"
-        ))),
+        _ => Err(RsqliteError::Runtime(format!("no such function: {name}"))),
     }
 }
 
 /// Resolve subqueries in an expression tree by executing them and
 /// replacing them with their results (literal values).
-fn resolve_subqueries(
-    expr: &Expr,
-    pager: &mut Pager,
-    tables: &[TableSchema],
-) -> Result<Expr> {
+fn resolve_subqueries(expr: &Expr, pager: &mut Pager, tables: &[TableSchema]) -> Result<Expr> {
     match expr {
         // IN (SELECT ...) → IN (value1, value2, ...)
         Expr::In {
@@ -1970,14 +2001,15 @@ fn resolve_subqueries(
             })
         }
         // EXISTS (SELECT ...) → 1 or 0
-        Expr::Exists {
-            subquery,
-            negated,
-        } => {
+        Expr::Exists { subquery, negated } => {
             let result = execute_select(pager, subquery, tables)?;
             let exists = !result.rows.is_empty();
             let truth = if *negated { !exists } else { exists };
-            Ok(Expr::Literal(LiteralValue::Integer(if truth { 1 } else { 0 })))
+            Ok(Expr::Literal(LiteralValue::Integer(if truth {
+                1
+            } else {
+                0
+            })))
         }
         // Scalar subquery: (SELECT x) → literal value
         Expr::Subquery(sub_select) => {
@@ -2000,9 +2032,9 @@ fn resolve_subqueries(
             op: *op,
             operand: Box::new(resolve_subqueries(operand, pager, tables)?),
         }),
-        Expr::Parenthesized(inner) => Ok(Expr::Parenthesized(Box::new(
-            resolve_subqueries(inner, pager, tables)?,
-        ))),
+        Expr::Parenthesized(inner) => Ok(Expr::Parenthesized(Box::new(resolve_subqueries(
+            inner, pager, tables,
+        )?))),
         Expr::IsNull { operand, negated } => Ok(Expr::IsNull {
             operand: Box::new(resolve_subqueries(operand, pager, tables)?),
             negated: *negated,
@@ -2095,9 +2127,7 @@ fn like_match(p: &[char], pi: usize, s: &[char], si: usize) -> bool {
             }
         }
         c => {
-            if si < s.len()
-                && c.to_ascii_lowercase() == s[si].to_ascii_lowercase()
-            {
+            if si < s.len() && c.eq_ignore_ascii_case(&s[si]) {
                 like_match(p, pi + 1, s, si + 1)
             } else {
                 false
@@ -2178,14 +2208,7 @@ mod tests {
 
     #[test]
     fn test_eval_literal() {
-        let val = eval_expr(
-            &Expr::Literal(LiteralValue::Integer(42)),
-            &[],
-            &[],
-            0,
-            None,
-        )
-        .unwrap();
+        let val = eval_expr(&Expr::Literal(LiteralValue::Integer(42)), &[], &[], 0, None).unwrap();
         assert_eq!(val, Value::Integer(42));
     }
 
@@ -2687,15 +2710,13 @@ mod tests {
 
     #[test]
     fn test_has_aggregate() {
-        let cols = vec![
-            ResultColumn::Expr {
-                expr: Expr::FunctionCall {
-                    name: "COUNT".into(),
-                    args: FunctionArgs::Wildcard,
-                },
-                alias: None,
+        let cols = vec![ResultColumn::Expr {
+            expr: Expr::FunctionCall {
+                name: "COUNT".into(),
+                args: FunctionArgs::Wildcard,
             },
-        ];
+            alias: None,
+        }];
         assert!(has_aggregate(&cols));
 
         let cols = vec![ResultColumn::AllColumns];

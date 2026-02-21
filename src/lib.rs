@@ -8,6 +8,7 @@ pub mod pager;
 pub mod parser;
 pub mod planner;
 pub mod record;
+pub mod schema;
 pub mod tokenizer;
 pub mod types;
 pub mod varint;

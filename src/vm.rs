@@ -1359,6 +1359,12 @@ pub fn eval_expr(
             let lo = eval_expr(low, column_names, values, rowid, table_name)?;
             let hi = eval_expr(high, column_names, values, rowid, table_name)?;
 
+            // SQL: if any operand is NULL, BETWEEN returns NULL.
+            if matches!(val, Value::Null) || matches!(lo, Value::Null) || matches!(hi, Value::Null)
+            {
+                return Ok(Value::Null);
+            }
+
             let ge_lo = crate::types::sqlite_cmp(&val, &lo) != std::cmp::Ordering::Less;
             let le_hi = crate::types::sqlite_cmp(&val, &hi) != std::cmp::Ordering::Greater;
             let in_range = ge_lo && le_hi;
@@ -1495,6 +1501,10 @@ pub fn eval_expr(
                 let base_val = eval_expr(base, column_names, values, rowid, table_name)?;
                 for (when_expr, then_expr) in when_clauses {
                     let when_val = eval_expr(when_expr, column_names, values, rowid, table_name)?;
+                    // SQL: NULL = NULL is NULL (falsy), so skip if either side is NULL.
+                    if matches!(base_val, Value::Null) || matches!(when_val, Value::Null) {
+                        continue;
+                    }
                     if crate::types::sqlite_cmp(&base_val, &when_val) == std::cmp::Ordering::Equal {
                         return eval_expr(then_expr, column_names, values, rowid, table_name);
                     }

@@ -124,19 +124,49 @@ pub fn execute_select(
         }
     }
 
-    // Build result columns.
-    let (result_columns, result_rows) =
-        project_columns(&stmt.columns, &column_names, &filtered_rows, table_name)?;
+    // Handle GROUP BY and aggregates.
+    let (result_columns, result_rows, filtered_rows) = if stmt.group_by.is_some()
+        || has_aggregate(&stmt.columns)
+    {
+        let (cols, rows) = execute_group_by(
+            &stmt.columns,
+            &stmt.group_by,
+            &stmt.having,
+            &column_names,
+            &filtered_rows,
+            table_name,
+        )?;
+        // For ORDER BY after GROUP BY, we need the grouped "filtered_rows" equivalent.
+        // Create synthetic filtered rows from the result for ORDER BY.
+        let synth_rows: Vec<(i64, Vec<Value>)> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (i as i64, r.values.clone()))
+            .collect();
+        (cols, rows, synth_rows)
+    } else {
+        let (cols, rows) =
+            project_columns(&stmt.columns, &column_names, &filtered_rows, table_name)?;
+        (cols, rows, filtered_rows)
+    };
 
     // Apply ORDER BY.
     let mut result_rows = result_rows;
     if let Some(ref order_by) = stmt.order_by {
-        // Build sort keys for each row.
+        // For ORDER BY after GROUP BY, evaluate expressions against result columns.
+        // For regular queries, evaluate against source columns.
+        let order_col_names: Vec<&str> = if stmt.group_by.is_some() || has_aggregate(&stmt.columns)
+        {
+            result_columns.iter().map(|c| c.name.as_str()).collect()
+        } else {
+            column_names.clone()
+        };
+
         let mut indexed: Vec<(usize, Vec<Value>)> = Vec::new();
         for (i, (rowid, values)) in filtered_rows.iter().enumerate() {
             let mut keys = Vec::new();
             for item in order_by {
-                let key = eval_expr(&item.expr, &column_names, values, *rowid, table_name)?;
+                let key = eval_expr(&item.expr, &order_col_names, values, *rowid, table_name)?;
                 keys.push(key);
             }
             indexed.push((i, keys));
@@ -192,6 +222,446 @@ pub fn execute_select(
         columns: result_columns,
         rows: result_rows,
     })
+}
+
+/// Check if any result column contains an aggregate function.
+fn has_aggregate(columns: &[ResultColumn]) -> bool {
+    columns.iter().any(|rc| match rc {
+        ResultColumn::Expr { expr, .. } => expr_has_aggregate(expr),
+        _ => false,
+    })
+}
+
+/// Check if an expression contains an aggregate function call.
+fn expr_has_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall { name, .. } => is_aggregate_fn(name),
+        Expr::BinaryOp { left, right, .. } => {
+            expr_has_aggregate(left) || expr_has_aggregate(right)
+        }
+        Expr::UnaryOp { operand, .. } => expr_has_aggregate(operand),
+        Expr::Parenthesized(inner) => expr_has_aggregate(inner),
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            operand.as_ref().is_some_and(|e| expr_has_aggregate(e))
+                || when_clauses
+                    .iter()
+                    .any(|(w, t)| expr_has_aggregate(w) || expr_has_aggregate(t))
+                || else_clause.as_ref().is_some_and(|e| expr_has_aggregate(e))
+        }
+        _ => false,
+    }
+}
+
+/// Check if a function name is an aggregate function.
+fn is_aggregate_fn(name: &str) -> bool {
+    matches!(
+        name.to_uppercase().as_str(),
+        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
+    )
+}
+
+/// Execute GROUP BY with aggregate functions.
+fn execute_group_by(
+    select_columns: &[ResultColumn],
+    group_by: &Option<Vec<Expr>>,
+    having: &Option<Expr>,
+    column_names: &[&str],
+    rows: &[(i64, Vec<Value>)],
+    table_name: Option<&str>,
+) -> Result<(Vec<ColumnInfo>, Vec<Row>)> {
+    // Group rows by the GROUP BY key expressions.
+    let groups: Vec<(Vec<Value>, Vec<&(i64, Vec<Value>)>)> = if let Some(ref group_exprs) =
+        group_by
+    {
+        let mut group_map: Vec<(Vec<Value>, Vec<&(i64, Vec<Value>)>)> = Vec::new();
+
+        for row in rows {
+            let key: Vec<Value> = group_exprs
+                .iter()
+                .map(|e| eval_expr(e, column_names, &row.1, row.0, table_name))
+                .collect::<Result<_>>()?;
+
+            // Find existing group with same key.
+            let found = group_map.iter_mut().find(|(k, _)| {
+                k.len() == key.len()
+                    && k.iter()
+                        .zip(key.iter())
+                        .all(|(a, b)| crate::types::sqlite_cmp(a, b) == std::cmp::Ordering::Equal)
+            });
+
+            if let Some((_, group_rows)) = found {
+                group_rows.push(row);
+            } else {
+                group_map.push((key, vec![row]));
+            }
+        }
+
+        group_map
+    } else {
+        // No GROUP BY but has aggregates — treat all rows as one group.
+        if rows.is_empty() {
+            vec![(vec![], vec![])]
+        } else {
+            vec![(vec![], rows.iter().collect())]
+        }
+    };
+
+    // Build result columns info.
+    let mut col_infos: Vec<ColumnInfo> = Vec::new();
+    for rc in select_columns {
+        match rc {
+            ResultColumn::AllColumns => {
+                for name in column_names {
+                    col_infos.push(ColumnInfo {
+                        name: name.to_string(),
+                        table: table_name.map(|s| s.to_string()),
+                    });
+                }
+            }
+            ResultColumn::TableAllColumns(tname) => {
+                for name in column_names {
+                    col_infos.push(ColumnInfo {
+                        name: name.to_string(),
+                        table: Some(tname.clone()),
+                    });
+                }
+            }
+            ResultColumn::Expr { expr, alias } => {
+                let name = alias.clone().unwrap_or_else(|| expr_display_name(expr));
+                col_infos.push(ColumnInfo {
+                    name,
+                    table: None,
+                });
+            }
+        }
+    }
+
+    // Evaluate each group to produce result rows.
+    let mut result_rows = Vec::new();
+
+    for (_key, group_rows) in &groups {
+        let mut row_values = Vec::new();
+
+        for rc in select_columns {
+            match rc {
+                ResultColumn::AllColumns => {
+                    // Use the first row's values for non-aggregate columns.
+                    if let Some(first) = group_rows.first() {
+                        for val in &first.1 {
+                            row_values.push(val.clone());
+                        }
+                    } else {
+                        for _ in column_names {
+                            row_values.push(Value::Null);
+                        }
+                    }
+                }
+                ResultColumn::TableAllColumns(_) => {
+                    if let Some(first) = group_rows.first() {
+                        for val in &first.1 {
+                            row_values.push(val.clone());
+                        }
+                    } else {
+                        for _ in column_names {
+                            row_values.push(Value::Null);
+                        }
+                    }
+                }
+                ResultColumn::Expr { expr, .. } => {
+                    let val =
+                        eval_aggregate_expr(expr, column_names, group_rows, table_name)?;
+                    row_values.push(val);
+                }
+            }
+        }
+
+        // Apply HAVING filter.
+        if let Some(ref having_expr) = having {
+            let having_val =
+                eval_aggregate_expr(having_expr, column_names, group_rows, table_name)?;
+            if !having_val.is_truthy() {
+                continue;
+            }
+        }
+
+        result_rows.push(Row {
+            values: row_values,
+        });
+    }
+
+    Ok((col_infos, result_rows))
+}
+
+/// Evaluate an expression that may contain aggregate functions, given a group of rows.
+fn eval_aggregate_expr(
+    expr: &Expr,
+    column_names: &[&str],
+    group_rows: &[&(i64, Vec<Value>)],
+    table_name: Option<&str>,
+) -> Result<Value> {
+    match expr {
+        Expr::FunctionCall { name, args } if is_aggregate_fn(name) => {
+            eval_aggregate_function(name, args, column_names, group_rows, table_name)
+        }
+        // For non-aggregate expressions, use the first row of the group.
+        _ => {
+            if let Some(first) = group_rows.first() {
+                eval_expr(expr, column_names, &first.1, first.0, table_name)
+            } else {
+                Ok(Value::Null)
+            }
+        }
+    }
+}
+
+/// Evaluate an aggregate function over a group of rows.
+fn eval_aggregate_function(
+    name: &str,
+    args: &FunctionArgs,
+    column_names: &[&str],
+    group_rows: &[&(i64, Vec<Value>)],
+    table_name: Option<&str>,
+) -> Result<Value> {
+    let upper = name.to_uppercase();
+
+    match upper.as_str() {
+        "COUNT" => {
+            match args {
+                FunctionArgs::Wildcard => {
+                    // COUNT(*) counts all rows including NULLs.
+                    Ok(Value::Integer(group_rows.len() as i64))
+                }
+                FunctionArgs::Exprs { args: exprs, distinct } => {
+                    if exprs.is_empty() {
+                        return Ok(Value::Integer(group_rows.len() as i64));
+                    }
+                    let expr = &exprs[0];
+                    if *distinct {
+                        let mut seen: Vec<Value> = Vec::new();
+                        for row in group_rows {
+                            let val = eval_expr(expr, column_names, &row.1, row.0, table_name)?;
+                            if !val.is_null() {
+                                let already = seen.iter().any(|s| {
+                                    crate::types::sqlite_cmp(s, &val)
+                                        == std::cmp::Ordering::Equal
+                                });
+                                if !already {
+                                    seen.push(val);
+                                }
+                            }
+                        }
+                        Ok(Value::Integer(seen.len() as i64))
+                    } else {
+                        let mut count = 0i64;
+                        for row in group_rows {
+                            let val = eval_expr(expr, column_names, &row.1, row.0, table_name)?;
+                            if !val.is_null() {
+                                count += 1;
+                            }
+                        }
+                        Ok(Value::Integer(count))
+                    }
+                }
+            }
+        }
+        "SUM" => {
+            let expr = get_aggregate_arg(args)?;
+            let mut int_sum: i64 = 0;
+            let mut real_sum: f64 = 0.0;
+            let mut has_real = false;
+            let mut all_null = true;
+
+            for row in group_rows {
+                let val = eval_expr(expr, column_names, &row.1, row.0, table_name)?;
+                match val {
+                    Value::Integer(n) => {
+                        int_sum += n;
+                        all_null = false;
+                    }
+                    Value::Real(f) => {
+                        real_sum += f;
+                        has_real = true;
+                        all_null = false;
+                    }
+                    Value::Null => {}
+                    Value::Text(ref s) => {
+                        if let Ok(n) = s.parse::<i64>() {
+                            int_sum += n;
+                            all_null = false;
+                        } else if let Ok(f) = s.parse::<f64>() {
+                            real_sum += f;
+                            has_real = true;
+                            all_null = false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if all_null {
+                Ok(Value::Null)
+            } else if has_real {
+                Ok(Value::Real(real_sum + int_sum as f64))
+            } else {
+                Ok(Value::Integer(int_sum))
+            }
+        }
+        "TOTAL" => {
+            let expr = get_aggregate_arg(args)?;
+            let mut total: f64 = 0.0;
+
+            for row in group_rows {
+                let val = eval_expr(expr, column_names, &row.1, row.0, table_name)?;
+                match val {
+                    Value::Integer(n) => total += n as f64,
+                    Value::Real(f) => total += f,
+                    _ => {}
+                }
+            }
+
+            Ok(Value::Real(total))
+        }
+        "AVG" => {
+            let expr = get_aggregate_arg(args)?;
+            let mut sum: f64 = 0.0;
+            let mut count: i64 = 0;
+
+            for row in group_rows {
+                let val = eval_expr(expr, column_names, &row.1, row.0, table_name)?;
+                match val {
+                    Value::Integer(n) => {
+                        sum += n as f64;
+                        count += 1;
+                    }
+                    Value::Real(f) => {
+                        sum += f;
+                        count += 1;
+                    }
+                    Value::Null => {}
+                    Value::Text(ref s) => {
+                        if let Ok(f) = s.parse::<f64>() {
+                            sum += f;
+                            count += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if count == 0 {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Real(sum / count as f64))
+            }
+        }
+        "MIN" => {
+            let expr = get_aggregate_arg(args)?;
+            let mut min: Option<Value> = None;
+
+            for row in group_rows {
+                let val = eval_expr(expr, column_names, &row.1, row.0, table_name)?;
+                if val.is_null() {
+                    continue;
+                }
+                min = Some(match min {
+                    Some(ref m) => {
+                        if crate::types::sqlite_cmp(&val, m) == std::cmp::Ordering::Less {
+                            val
+                        } else {
+                            m.clone()
+                        }
+                    }
+                    None => val,
+                });
+            }
+
+            Ok(min.unwrap_or(Value::Null))
+        }
+        "MAX" => {
+            let expr = get_aggregate_arg(args)?;
+            let mut max: Option<Value> = None;
+
+            for row in group_rows {
+                let val = eval_expr(expr, column_names, &row.1, row.0, table_name)?;
+                if val.is_null() {
+                    continue;
+                }
+                max = Some(match max {
+                    Some(ref m) => {
+                        if crate::types::sqlite_cmp(&val, m) == std::cmp::Ordering::Greater {
+                            val
+                        } else {
+                            m.clone()
+                        }
+                    }
+                    None => val,
+                });
+            }
+
+            Ok(max.unwrap_or(Value::Null))
+        }
+        "GROUP_CONCAT" => {
+            match args {
+                FunctionArgs::Wildcard => Ok(Value::Null),
+                FunctionArgs::Exprs { args: exprs, .. } => {
+                    if exprs.is_empty() {
+                        return Ok(Value::Null);
+                    }
+                    let expr = &exprs[0];
+                    let separator = if exprs.len() > 1 {
+                        if let Some(first) = group_rows.first() {
+                            eval_expr(&exprs[1], column_names, &first.1, first.0, table_name)?
+                                .to_text()
+                                .unwrap_or_else(|| ",".to_string())
+                        } else {
+                            ",".to_string()
+                        }
+                    } else {
+                        ",".to_string()
+                    };
+
+                    let mut parts = Vec::new();
+                    for row in group_rows {
+                        let val = eval_expr(expr, column_names, &row.1, row.0, table_name)?;
+                        if !val.is_null() {
+                            parts.push(val.to_text().unwrap_or_default());
+                        }
+                    }
+
+                    if parts.is_empty() {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(Value::Text(parts.join(&separator)))
+                    }
+                }
+            }
+        }
+        _ => Err(RsqliteError::Runtime(format!(
+            "unknown aggregate function: {name}"
+        ))),
+    }
+}
+
+/// Extract the single argument expression from aggregate function args.
+fn get_aggregate_arg(args: &FunctionArgs) -> Result<&Expr> {
+    match args {
+        FunctionArgs::Wildcard => Err(RsqliteError::Runtime(
+            "aggregate function does not accept *".into(),
+        )),
+        FunctionArgs::Exprs { args: exprs, .. } => {
+            if exprs.len() != 1 {
+                Err(RsqliteError::Runtime(
+                    "aggregate function takes exactly 1 argument".into(),
+                ))
+            } else {
+                Ok(&exprs[0])
+            }
+        }
+    }
 }
 
 /// Project raw rows into result columns based on the SELECT column list.
@@ -1219,5 +1689,263 @@ mod tests {
         };
         let val = eval_expr(&expr, &cols, &values, 42, None).unwrap();
         assert_eq!(val, Value::Integer(42));
+    }
+
+    // -- Aggregate tests --
+
+    fn make_rows(data: &[(i64, Vec<Value>)]) -> Vec<(i64, Vec<Value>)> {
+        data.to_vec()
+    }
+
+    #[test]
+    fn test_count_star() {
+        let rows = make_rows(&[
+            (1, vec![Value::Text("a".into()), Value::Integer(10)]),
+            (2, vec![Value::Text("b".into()), Value::Integer(20)]),
+            (3, vec![Value::Text("c".into()), Value::Integer(30)]),
+        ]);
+        let group_rows: Vec<&(i64, Vec<Value>)> = rows.iter().collect();
+        let result = eval_aggregate_function(
+            "COUNT",
+            &FunctionArgs::Wildcard,
+            &["name", "value"],
+            &group_rows,
+            None,
+        )
+        .unwrap();
+        assert_eq!(result, Value::Integer(3));
+    }
+
+    #[test]
+    fn test_count_column() {
+        let rows = make_rows(&[
+            (1, vec![Value::Integer(10)]),
+            (2, vec![Value::Null]),
+            (3, vec![Value::Integer(30)]),
+        ]);
+        let group_rows: Vec<&(i64, Vec<Value>)> = rows.iter().collect();
+        let result = eval_aggregate_function(
+            "COUNT",
+            &FunctionArgs::Exprs {
+                distinct: false,
+                args: vec![Expr::ColumnRef {
+                    table: None,
+                    column: "x".into(),
+                }],
+            },
+            &["x"],
+            &group_rows,
+            None,
+        )
+        .unwrap();
+        // COUNT(x) should not count NULLs.
+        assert_eq!(result, Value::Integer(2));
+    }
+
+    #[test]
+    fn test_sum() {
+        let rows = make_rows(&[
+            (1, vec![Value::Integer(10)]),
+            (2, vec![Value::Integer(20)]),
+            (3, vec![Value::Integer(30)]),
+        ]);
+        let group_rows: Vec<&(i64, Vec<Value>)> = rows.iter().collect();
+        let result = eval_aggregate_function(
+            "SUM",
+            &FunctionArgs::Exprs {
+                distinct: false,
+                args: vec![Expr::ColumnRef {
+                    table: None,
+                    column: "x".into(),
+                }],
+            },
+            &["x"],
+            &group_rows,
+            None,
+        )
+        .unwrap();
+        assert_eq!(result, Value::Integer(60));
+    }
+
+    #[test]
+    fn test_avg() {
+        let rows = make_rows(&[
+            (1, vec![Value::Integer(10)]),
+            (2, vec![Value::Integer(20)]),
+            (3, vec![Value::Integer(30)]),
+        ]);
+        let group_rows: Vec<&(i64, Vec<Value>)> = rows.iter().collect();
+        let result = eval_aggregate_function(
+            "AVG",
+            &FunctionArgs::Exprs {
+                distinct: false,
+                args: vec![Expr::ColumnRef {
+                    table: None,
+                    column: "x".into(),
+                }],
+            },
+            &["x"],
+            &group_rows,
+            None,
+        )
+        .unwrap();
+        assert_eq!(result, Value::Real(20.0));
+    }
+
+    #[test]
+    fn test_min_max() {
+        let rows = make_rows(&[
+            (1, vec![Value::Integer(10)]),
+            (2, vec![Value::Integer(5)]),
+            (3, vec![Value::Integer(30)]),
+        ]);
+        let group_rows: Vec<&(i64, Vec<Value>)> = rows.iter().collect();
+
+        let min = eval_aggregate_function(
+            "MIN",
+            &FunctionArgs::Exprs {
+                distinct: false,
+                args: vec![Expr::ColumnRef {
+                    table: None,
+                    column: "x".into(),
+                }],
+            },
+            &["x"],
+            &group_rows,
+            None,
+        )
+        .unwrap();
+        assert_eq!(min, Value::Integer(5));
+
+        let max = eval_aggregate_function(
+            "MAX",
+            &FunctionArgs::Exprs {
+                distinct: false,
+                args: vec![Expr::ColumnRef {
+                    table: None,
+                    column: "x".into(),
+                }],
+            },
+            &["x"],
+            &group_rows,
+            None,
+        )
+        .unwrap();
+        assert_eq!(max, Value::Integer(30));
+    }
+
+    #[test]
+    fn test_sum_with_nulls() {
+        let rows = make_rows(&[
+            (1, vec![Value::Integer(10)]),
+            (2, vec![Value::Null]),
+            (3, vec![Value::Integer(30)]),
+        ]);
+        let group_rows: Vec<&(i64, Vec<Value>)> = rows.iter().collect();
+        let result = eval_aggregate_function(
+            "SUM",
+            &FunctionArgs::Exprs {
+                distinct: false,
+                args: vec![Expr::ColumnRef {
+                    table: None,
+                    column: "x".into(),
+                }],
+            },
+            &["x"],
+            &group_rows,
+            None,
+        )
+        .unwrap();
+        assert_eq!(result, Value::Integer(40));
+    }
+
+    #[test]
+    fn test_sum_all_null() {
+        let rows = make_rows(&[(1, vec![Value::Null]), (2, vec![Value::Null])]);
+        let group_rows: Vec<&(i64, Vec<Value>)> = rows.iter().collect();
+        let result = eval_aggregate_function(
+            "SUM",
+            &FunctionArgs::Exprs {
+                distinct: false,
+                args: vec![Expr::ColumnRef {
+                    table: None,
+                    column: "x".into(),
+                }],
+            },
+            &["x"],
+            &group_rows,
+            None,
+        )
+        .unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn test_count_distinct() {
+        let rows = make_rows(&[
+            (1, vec![Value::Text("a".into())]),
+            (2, vec![Value::Text("b".into())]),
+            (3, vec![Value::Text("a".into())]),
+            (4, vec![Value::Null]),
+        ]);
+        let group_rows: Vec<&(i64, Vec<Value>)> = rows.iter().collect();
+        let result = eval_aggregate_function(
+            "COUNT",
+            &FunctionArgs::Exprs {
+                distinct: true,
+                args: vec![Expr::ColumnRef {
+                    table: None,
+                    column: "x".into(),
+                }],
+            },
+            &["x"],
+            &group_rows,
+            None,
+        )
+        .unwrap();
+        // 'a' and 'b' are distinct non-null values.
+        assert_eq!(result, Value::Integer(2));
+    }
+
+    #[test]
+    fn test_group_concat() {
+        let rows = make_rows(&[
+            (1, vec![Value::Text("a".into())]),
+            (2, vec![Value::Text("b".into())]),
+            (3, vec![Value::Text("c".into())]),
+        ]);
+        let group_rows: Vec<&(i64, Vec<Value>)> = rows.iter().collect();
+        let result = eval_aggregate_function(
+            "GROUP_CONCAT",
+            &FunctionArgs::Exprs {
+                distinct: false,
+                args: vec![Expr::ColumnRef {
+                    table: None,
+                    column: "x".into(),
+                }],
+            },
+            &["x"],
+            &group_rows,
+            None,
+        )
+        .unwrap();
+        assert_eq!(result, Value::Text("a,b,c".into()));
+    }
+
+    #[test]
+    fn test_has_aggregate() {
+        let cols = vec![
+            ResultColumn::Expr {
+                expr: Expr::FunctionCall {
+                    name: "COUNT".into(),
+                    args: FunctionArgs::Wildcard,
+                },
+                alias: None,
+            },
+        ];
+        assert!(has_aggregate(&cols));
+
+        let cols = vec![ResultColumn::AllColumns];
+        assert!(!has_aggregate(&cols));
     }
 }

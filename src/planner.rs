@@ -1581,4 +1581,212 @@ mod tests {
             assert_eq!(row.values[0], Value::Integer(i as i64 + 1));
         }
     }
+
+    // -- JOIN tests --
+
+    fn setup_join_db() -> Database {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER)")
+            .unwrap();
+        db.execute("CREATE TABLE departments (id INTEGER PRIMARY KEY, dept_name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO departments VALUES (1, 'Engineering')")
+            .unwrap();
+        db.execute("INSERT INTO departments VALUES (2, 'Sales')")
+            .unwrap();
+        db.execute("INSERT INTO departments VALUES (3, 'Marketing')")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice', 1)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob', 2)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (3, 'Charlie', 1)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (4, 'Diana', NULL)")
+            .unwrap();
+        db
+    }
+
+    #[test]
+    fn test_inner_join_on() {
+        let mut db = setup_join_db();
+        let result = db
+            .execute(
+                "SELECT users.name, departments.dept_name \
+                 FROM users INNER JOIN departments ON users.dept_id = departments.id",
+            )
+            .unwrap();
+        // Diana has NULL dept_id, so she should not appear.
+        assert_eq!(result.rows.len(), 3);
+        let names: Vec<&Value> = result.rows.iter().map(|r| &r.values[0]).collect();
+        assert!(names.contains(&&Value::Text("Alice".into())));
+        assert!(names.contains(&&Value::Text("Bob".into())));
+        assert!(names.contains(&&Value::Text("Charlie".into())));
+    }
+
+    #[test]
+    fn test_left_join() {
+        let mut db = setup_join_db();
+        let result = db
+            .execute(
+                "SELECT users.name, departments.dept_name \
+                 FROM users LEFT JOIN departments ON users.dept_id = departments.id \
+                 ORDER BY users.id",
+            )
+            .unwrap();
+        // All 4 users should appear; Diana has NULL for dept_name.
+        assert_eq!(result.rows.len(), 4);
+        // Diana is last (id=4).
+        assert_eq!(result.rows[3].values[0], Value::Text("Diana".into()));
+        assert_eq!(result.rows[3].values[1], Value::Null);
+        // Alice is first (id=1), department = Engineering.
+        assert_eq!(result.rows[0].values[0], Value::Text("Alice".into()));
+        assert_eq!(
+            result.rows[0].values[1],
+            Value::Text("Engineering".into())
+        );
+    }
+
+    #[test]
+    fn test_cross_join() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE a (x INTEGER)").unwrap();
+        db.execute("CREATE TABLE b (y INTEGER)").unwrap();
+        db.execute("INSERT INTO a VALUES (1)").unwrap();
+        db.execute("INSERT INTO a VALUES (2)").unwrap();
+        db.execute("INSERT INTO b VALUES (10)").unwrap();
+        db.execute("INSERT INTO b VALUES (20)").unwrap();
+        db.execute("INSERT INTO b VALUES (30)").unwrap();
+
+        let result = db.execute("SELECT x, y FROM a CROSS JOIN b").unwrap();
+        // 2 * 3 = 6 rows.
+        assert_eq!(result.rows.len(), 6);
+    }
+
+    #[test]
+    fn test_join_using() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY, info TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t1 VALUES (1, 'a')").unwrap();
+        db.execute("INSERT INTO t1 VALUES (2, 'b')").unwrap();
+        db.execute("INSERT INTO t2 VALUES (1, 'x')").unwrap();
+        db.execute("INSERT INTO t2 VALUES (3, 'z')").unwrap();
+
+        let result = db
+            .execute("SELECT id, val, info FROM t1 INNER JOIN t2 USING (id)")
+            .unwrap();
+        // Only id=1 matches.
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values[0], Value::Integer(1));
+        assert_eq!(result.rows[0].values[1], Value::Text("a".into()));
+        assert_eq!(result.rows[0].values[2], Value::Text("x".into()));
+    }
+
+    #[test]
+    fn test_join_with_where() {
+        let mut db = setup_join_db();
+        let result = db
+            .execute(
+                "SELECT users.name, departments.dept_name \
+                 FROM users INNER JOIN departments ON users.dept_id = departments.id \
+                 WHERE departments.dept_name = 'Engineering'",
+            )
+            .unwrap();
+        assert_eq!(result.rows.len(), 2);
+        let names: Vec<&Value> = result.rows.iter().map(|r| &r.values[0]).collect();
+        assert!(names.contains(&&Value::Text("Alice".into())));
+        assert!(names.contains(&&Value::Text("Charlie".into())));
+    }
+
+    #[test]
+    fn test_join_with_aggregate() {
+        let mut db = setup_join_db();
+        let result = db
+            .execute(
+                "SELECT departments.dept_name, COUNT(*) \
+                 FROM users INNER JOIN departments ON users.dept_id = departments.id \
+                 GROUP BY departments.dept_name \
+                 ORDER BY departments.dept_name",
+            )
+            .unwrap();
+        // Engineering: 2 (Alice, Charlie), Sales: 1 (Bob)
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(
+            result.rows[0].values[0],
+            Value::Text("Engineering".into())
+        );
+        assert_eq!(result.rows[0].values[1], Value::Integer(2));
+        assert_eq!(result.rows[1].values[0], Value::Text("Sales".into()));
+        assert_eq!(result.rows[1].values[1], Value::Integer(1));
+    }
+
+    #[test]
+    fn test_implicit_join() {
+        let mut db = setup_join_db();
+        // Implicit join via comma in FROM (treated as CROSS JOIN).
+        let result = db
+            .execute(
+                "SELECT users.name, departments.dept_name \
+                 FROM users, departments \
+                 WHERE users.dept_id = departments.id \
+                 ORDER BY users.id",
+            )
+            .unwrap();
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(result.rows[0].values[0], Value::Text("Alice".into()));
+        assert_eq!(
+            result.rows[0].values[1],
+            Value::Text("Engineering".into())
+        );
+    }
+
+    #[test]
+    fn test_left_join_unmatched_right() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount REAL)")
+            .unwrap();
+        db.execute("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO customers VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO customers VALUES (2, 'Bob')").unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 1, 99.99)").unwrap();
+
+        let result = db
+            .execute(
+                "SELECT customers.name, orders.amount \
+                 FROM customers LEFT JOIN orders ON customers.id = orders.customer_id \
+                 ORDER BY customers.id",
+            )
+            .unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].values[0], Value::Text("Alice".into()));
+        assert_eq!(result.rows[0].values[1], Value::Real(99.99));
+        assert_eq!(result.rows[1].values[0], Value::Text("Bob".into()));
+        assert_eq!(result.rows[1].values[1], Value::Null);
+    }
+
+    #[test]
+    fn test_self_join() {
+        let mut db = Database::in_memory();
+        db.execute("CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, manager_id INTEGER)")
+            .unwrap();
+        db.execute("INSERT INTO employees VALUES (1, 'Boss', NULL)")
+            .unwrap();
+        db.execute("INSERT INTO employees VALUES (2, 'Alice', 1)")
+            .unwrap();
+        db.execute("INSERT INTO employees VALUES (3, 'Bob', 1)")
+            .unwrap();
+
+        let result = db
+            .execute(
+                "SELECT e.name, m.name \
+                 FROM employees AS e INNER JOIN employees AS m ON e.manager_id = m.id",
+            )
+            .unwrap();
+        // Boss has no manager (NULL), so only Alice and Bob appear.
+        assert_eq!(result.rows.len(), 2);
+    }
 }

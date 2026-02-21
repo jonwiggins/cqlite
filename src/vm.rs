@@ -4,7 +4,8 @@
 // The executor evaluates expressions, applies predicates, and produces rows.
 
 use crate::ast::{
-    BinaryOp, Expr, FunctionArgs, LiteralValue, ResultColumn, SelectStatement, UnaryOp,
+    BinaryOp, Expr, FunctionArgs, JoinConstraint, JoinType, LiteralValue, ResultColumn,
+    SelectStatement, UnaryOp,
 };
 use crate::btree::BTreeCursor;
 use crate::error::{Result, RsqliteError};
@@ -44,13 +45,39 @@ pub struct QueryResult {
     pub rows: Vec<Row>,
 }
 
+/// Scan all rows from a table, handling INTEGER PRIMARY KEY substitution.
+fn scan_table(pager: &mut Pager, schema: &TableSchema) -> Result<Vec<(i64, Vec<Value>)>> {
+    let mut rows = Vec::new();
+    let mut cursor = BTreeCursor::new(schema.root_page);
+    cursor.move_to_first(pager)?;
+
+    while cursor.is_valid() {
+        let rowid = cursor.current_rowid(pager)?;
+        let payload = cursor.current_payload(pager)?;
+        let mut values = record::decode_record(&payload)?;
+
+        if let Some(pk_idx) = schema.rowid_column {
+            if pk_idx < values.len() {
+                values[pk_idx] = Value::Integer(rowid);
+            } else if values.len() < schema.columns.len() {
+                values.insert(pk_idx, Value::Integer(rowid));
+            }
+        }
+
+        rows.push((rowid, values));
+        cursor.move_to_next(pager)?;
+    }
+
+    Ok(rows)
+}
+
 /// Execute a SELECT statement against the database.
 pub fn execute_select(
     pager: &mut Pager,
     stmt: &SelectStatement,
     tables: &[TableSchema],
 ) -> Result<QueryResult> {
-    // Determine the source table.
+    // Determine the source table(s).
     let (table_schema, _table_alias) = match &stmt.from {
         Some(from) => {
             let (table_name, alias) = match &from.table {
@@ -74,44 +101,179 @@ pub fn execute_select(
         None => (None, String::new()),
     };
 
-    if !stmt.from.as_ref().map(|f| f.joins.is_empty()).unwrap_or(true) {
-        return Err(RsqliteError::NotImplemented("JOINs".into()));
-    }
+    // Build the combined column names and rows, handling JOINs.
+    let has_joins = stmt
+        .from
+        .as_ref()
+        .map(|f| !f.joins.is_empty())
+        .unwrap_or(false);
 
-    // Scan the table.
-    let mut raw_rows: Vec<(i64, Vec<Value>)> = Vec::new();
+    let (column_names_owned, raw_rows, table_name) = if has_joins {
+        let from = stmt.from.as_ref().unwrap();
+        let left_schema = table_schema.unwrap();
+        let left_rows = scan_table(pager, left_schema)?;
 
-    if let Some(schema) = table_schema {
-        let mut cursor = BTreeCursor::new(schema.root_page);
-        cursor.move_to_first(pager)?;
+        // Determine the left table alias.
+        let left_alias = match &from.table {
+            crate::ast::TableRef::Table { name, alias } => {
+                alias.as_deref().unwrap_or(name.as_str()).to_string()
+            }
+            _ => left_schema.name.clone(),
+        };
 
-        while cursor.is_valid() {
-            let rowid = cursor.current_rowid(pager)?;
-            let payload = cursor.current_payload(pager)?;
-            let mut values = record::decode_record(&payload)?;
+        // Start with the left table's columns (qualified with alias) and rows.
+        let mut combined_columns: Vec<String> = left_schema
+            .columns
+            .iter()
+            .map(|c| format!("{}.{}", left_alias, c))
+            .collect();
+        let mut combined_rows: Vec<(i64, Vec<Value>)> = left_rows;
 
-            // If this table has an INTEGER PRIMARY KEY column (rowid alias),
-            // the record stores NULL for that column. Replace it with the rowid.
-            if let Some(pk_idx) = schema.rowid_column {
-                if pk_idx < values.len() {
-                    values[pk_idx] = Value::Integer(rowid);
-                } else if values.len() < schema.columns.len() {
-                    // Some schemas omit the column entirely.
-                    values.insert(pk_idx, Value::Integer(rowid));
+        for join in &from.joins {
+            let (right_name, right_alias) = match &join.table {
+                crate::ast::TableRef::Table { name, alias } => {
+                    (name.as_str(), alias.as_deref().unwrap_or(name.as_str()))
+                }
+                _ => {
+                    return Err(RsqliteError::NotImplemented(
+                        "subquery in JOIN".into(),
+                    ))
+                }
+            };
+            let right_schema = tables
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(right_name))
+                .ok_or_else(|| {
+                    RsqliteError::Runtime(format!("no such table: {right_name}"))
+                })?;
+
+            let right_rows = scan_table(pager, right_schema)?;
+
+            // For USING clause, find the common column indices.
+            let using_cols: Option<Vec<(usize, usize)>> = match &join.constraint {
+                Some(JoinConstraint::Using(cols)) => {
+                    let mut pairs = Vec::new();
+                    for col_name in cols {
+                        // Left columns are qualified; search by bare name.
+                        let left_idx = combined_columns
+                            .iter()
+                            .position(|c| {
+                                let bare = c.rfind('.').map(|p| &c[p + 1..]).unwrap_or(c);
+                                bare.eq_ignore_ascii_case(col_name)
+                            })
+                            .ok_or_else(|| {
+                                RsqliteError::Runtime(format!(
+                                    "column {col_name} not found in left table"
+                                ))
+                            })?;
+                        let right_idx = right_schema
+                            .columns
+                            .iter()
+                            .position(|c| c.eq_ignore_ascii_case(col_name))
+                            .ok_or_else(|| {
+                                RsqliteError::Runtime(format!(
+                                    "column {col_name} not found in table {right_name}"
+                                ))
+                            })?;
+                        pairs.push((left_idx, right_idx));
+                    }
+                    Some(pairs)
+                }
+                _ => None,
+            };
+
+            // Build combined columns (for USING, skip duplicate columns from right).
+            let right_col_start = combined_columns.len();
+            let mut skip_right_cols: Vec<bool> = vec![false; right_schema.columns.len()];
+            if let Some(ref pairs) = using_cols {
+                for &(_, right_idx) in pairs {
+                    skip_right_cols[right_idx] = true;
+                }
+            }
+            for (i, col) in right_schema.columns.iter().enumerate() {
+                if !skip_right_cols[i] {
+                    combined_columns.push(format!("{}.{}", right_alias, col));
                 }
             }
 
-            raw_rows.push((rowid, values));
-            cursor.move_to_next(pager)?;
+            // Build the all_columns list for expression evaluation during ON.
+            let all_columns: Vec<&str> = combined_columns.iter().map(|c| c.as_str()).collect();
+
+            // Nested loop join.
+            let mut new_rows: Vec<(i64, Vec<Value>)> = Vec::new();
+
+            for (left_rowid, left_values) in &combined_rows {
+                let mut matched = false;
+
+                for (_, right_values) in &right_rows {
+                    // Build combined row.
+                    let mut combined_values = left_values.clone();
+                    for (i, val) in right_values.iter().enumerate() {
+                        if !skip_right_cols[i] {
+                            combined_values.push(val.clone());
+                        }
+                    }
+
+                    // Check join condition.
+                    let passes = match &join.constraint {
+                        Some(JoinConstraint::On(expr)) => {
+                            let result = eval_expr(
+                                expr,
+                                &all_columns,
+                                &combined_values,
+                                *left_rowid,
+                                None,
+                            )?;
+                            result.is_truthy()
+                        }
+                        Some(JoinConstraint::Using(_)) => {
+                            // Check that the USING columns match.
+                            let pairs = using_cols.as_ref().unwrap();
+                            pairs.iter().all(|&(left_idx, right_idx)| {
+                                left_values.get(left_idx) == right_values.get(right_idx)
+                            })
+                        }
+                        None => true, // CROSS JOIN
+                    };
+
+                    if passes {
+                        matched = true;
+                        new_rows.push((*left_rowid, combined_values));
+                    }
+                }
+
+                // LEFT JOIN: if no match, include left row with NULLs for right columns.
+                if !matched && join.join_type == JoinType::Left {
+                    let mut combined_values = left_values.clone();
+                    let extra_cols = combined_columns.len() - right_col_start;
+                    for _ in 0..extra_cols {
+                        combined_values.push(Value::Null);
+                    }
+                    new_rows.push((*left_rowid, combined_values));
+                }
+            }
+
+            combined_rows = new_rows;
         }
-    }
+
+        let col_names: Vec<String> = combined_columns;
+        (col_names, combined_rows, None)
+    } else {
+        // No JOINs - single table scan.
+        let mut raw_rows: Vec<(i64, Vec<Value>)> = Vec::new();
+        if let Some(schema) = table_schema {
+            raw_rows = scan_table(pager, schema)?;
+        }
+        let col_names: Vec<String> = table_schema
+            .map(|s| s.columns.clone())
+            .unwrap_or_default();
+        let tname = table_schema.map(|s| s.name.as_str());
+        (col_names, raw_rows, tname)
+    };
+
+    let column_names: Vec<&str> = column_names_owned.iter().map(|c| c.as_str()).collect();
 
     // Apply WHERE filter.
-    let column_names: Vec<&str> = table_schema
-        .map(|s| s.columns.iter().map(|c| c.as_str()).collect())
-        .unwrap_or_default();
-    let table_name = table_schema.map(|s| s.name.as_str());
-
     let mut filtered_rows: Vec<(i64, Vec<Value>)> = Vec::new();
     for (rowid, values) in &raw_rows {
         if let Some(ref where_expr) = stmt.where_clause {
@@ -679,18 +841,25 @@ fn project_columns(
         match rc {
             ResultColumn::AllColumns => {
                 for (i, &name) in column_names.iter().enumerate() {
+                    // In JOIN context, column names may be qualified like "table.col".
+                    // Display just the bare column name.
+                    let display_name = if let Some(dot_pos) = name.rfind('.') {
+                        &name[dot_pos + 1..]
+                    } else {
+                        name
+                    };
                     col_infos.push(ColumnInfo {
-                        name: name.to_string(),
+                        name: display_name.to_string(),
                         table: table_name.map(|s| s.to_string()),
                     });
                     projections.push(ColumnProjection::Index(i));
                 }
             }
             ResultColumn::TableAllColumns(tname) => {
-                // Only support single-table for now.
                 if table_name.is_some()
                     && table_name.unwrap().eq_ignore_ascii_case(tname)
                 {
+                    // Single-table context.
                     for (i, &name) in column_names.iter().enumerate() {
                         col_infos.push(ColumnInfo {
                             name: name.to_string(),
@@ -699,9 +868,25 @@ fn project_columns(
                         projections.push(ColumnProjection::Index(i));
                     }
                 } else {
-                    return Err(RsqliteError::Runtime(format!(
-                        "no such table: {tname}"
-                    )));
+                    // JOIN context: find columns with the matching table prefix.
+                    let prefix = format!("{}.", tname);
+                    let mut found = false;
+                    for (i, &name) in column_names.iter().enumerate() {
+                        if name.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase()) {
+                            let bare = &name[prefix.len()..];
+                            col_infos.push(ColumnInfo {
+                                name: bare.to_string(),
+                                table: Some(tname.clone()),
+                            });
+                            projections.push(ColumnProjection::Index(i));
+                            found = true;
+                        }
+                    }
+                    if !found {
+                        return Err(RsqliteError::Runtime(format!(
+                            "no such table: {tname}"
+                        )));
+                    }
                 }
             }
             ResultColumn::Expr { expr, alias } => {
@@ -777,17 +962,6 @@ fn resolve_column(
     column_names: &[&str],
     row_table: Option<&str>,
 ) -> Result<usize> {
-    // Check table qualifier matches if provided.
-    if let Some(t) = table {
-        if let Some(rt) = row_table {
-            if !t.eq_ignore_ascii_case(rt) {
-                return Err(RsqliteError::Runtime(format!(
-                    "no such table: {t}"
-                )));
-            }
-        }
-    }
-
     // Handle rowid aliases.
     if column.eq_ignore_ascii_case("rowid")
         || column.eq_ignore_ascii_case("_rowid_")
@@ -796,10 +970,50 @@ fn resolve_column(
         return Err(RsqliteError::Runtime("__rowid__".into())); // Special marker
     }
 
-    column_names
-        .iter()
-        .position(|&n| n.eq_ignore_ascii_case(column))
-        .ok_or_else(|| RsqliteError::Runtime(format!("no such column: {column}")))
+    // Single-table context: check table qualifier matches.
+    if let Some(rt) = row_table {
+        if let Some(t) = table {
+            if !t.eq_ignore_ascii_case(rt) {
+                return Err(RsqliteError::Runtime(format!("no such table: {t}")));
+            }
+        }
+        return column_names
+            .iter()
+            .position(|&n| n.eq_ignore_ascii_case(column))
+            .ok_or_else(|| RsqliteError::Runtime(format!("no such column: {column}")));
+    }
+
+    // JOIN context (row_table is None): column names may be qualified like "table.col".
+    if let Some(t) = table {
+        // Try exact qualified match: "table.column".
+        let qualified = format!("{}.{}", t, column);
+        if let Some(pos) = column_names
+            .iter()
+            .position(|&n| n.eq_ignore_ascii_case(&qualified))
+        {
+            return Ok(pos);
+        }
+    }
+
+    // Try unqualified match: search for column names that end with ".column" or are exactly "column".
+    let mut found = None;
+    for (i, &name) in column_names.iter().enumerate() {
+        let bare = if let Some(dot_pos) = name.rfind('.') {
+            &name[dot_pos + 1..]
+        } else {
+            name
+        };
+        if bare.eq_ignore_ascii_case(column) {
+            if found.is_some() {
+                return Err(RsqliteError::Runtime(format!(
+                    "ambiguous column name: {column}"
+                )));
+            }
+            found = Some(i);
+        }
+    }
+
+    found.ok_or_else(|| RsqliteError::Runtime(format!("no such column: {column}")))
 }
 
 /// Evaluate an expression given a row's values and column names.

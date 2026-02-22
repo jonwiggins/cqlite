@@ -1421,3 +1421,180 @@ fn test_cte_recursive() {
     assert_eq!(rows[3][0], Value::Integer(4));
     assert_eq!(rows[4][0], Value::Integer(5));
 }
+
+// -- NATURAL JOIN tests --
+
+#[test]
+fn test_natural_join() {
+    let mut db = Database::in_memory();
+    exec(&mut db, "CREATE TABLE t1 (id INTEGER, name TEXT);");
+    exec(&mut db, "CREATE TABLE t2 (id INTEGER, dept TEXT);");
+    exec(&mut db, "INSERT INTO t1 VALUES (1, 'Alice');");
+    exec(&mut db, "INSERT INTO t1 VALUES (2, 'Bob');");
+    exec(&mut db, "INSERT INTO t2 VALUES (1, 'Engineering');");
+    exec(&mut db, "INSERT INTO t2 VALUES (3, 'Sales');");
+
+    let rows = query(&mut db, "SELECT * FROM t1 NATURAL JOIN t2;");
+    // Only id=1 matches between both tables
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Integer(1));
+    assert_eq!(rows[0][1], Value::Text("Alice".into()));
+    assert_eq!(rows[0][2], Value::Text("Engineering".into()));
+}
+
+#[test]
+fn test_natural_left_join() {
+    let mut db = Database::in_memory();
+    exec(&mut db, "CREATE TABLE t1 (id INTEGER, name TEXT);");
+    exec(&mut db, "CREATE TABLE t2 (id INTEGER, dept TEXT);");
+    exec(&mut db, "INSERT INTO t1 VALUES (1, 'Alice');");
+    exec(&mut db, "INSERT INTO t1 VALUES (2, 'Bob');");
+    exec(&mut db, "INSERT INTO t2 VALUES (1, 'Engineering');");
+
+    let rows = query(
+        &mut db,
+        "SELECT name, dept FROM t1 NATURAL LEFT JOIN t2 ORDER BY name;",
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0], Value::Text("Alice".into()));
+    assert_eq!(rows[0][1], Value::Text("Engineering".into()));
+    assert_eq!(rows[1][0], Value::Text("Bob".into()));
+    assert_eq!(rows[1][1], Value::Null);
+}
+
+// -- RIGHT JOIN tests --
+
+#[test]
+fn test_right_join() {
+    let mut db = Database::in_memory();
+    exec(&mut db, "CREATE TABLE t1 (id INTEGER, name TEXT);");
+    exec(&mut db, "CREATE TABLE t2 (id INTEGER, dept TEXT);");
+    exec(&mut db, "INSERT INTO t1 VALUES (1, 'Alice');");
+    exec(&mut db, "INSERT INTO t2 VALUES (1, 'Engineering');");
+    exec(&mut db, "INSERT INTO t2 VALUES (2, 'Sales');");
+
+    let rows = query(
+        &mut db,
+        "SELECT t1.name, t2.dept FROM t1 RIGHT JOIN t2 ON t1.id = t2.id ORDER BY t2.dept;",
+    );
+    assert_eq!(rows.len(), 2);
+    // Engineering matches t1
+    assert_eq!(rows[0][0], Value::Text("Alice".into()));
+    assert_eq!(rows[0][1], Value::Text("Engineering".into()));
+    // Sales has no match in t1
+    assert_eq!(rows[1][0], Value::Null);
+    assert_eq!(rows[1][1], Value::Text("Sales".into()));
+}
+
+// -- Date/time function tests --
+
+#[test]
+fn test_date_function() {
+    let mut db = Database::in_memory();
+    let rows = query(&mut db, "SELECT date('2023-06-15 14:30:00');");
+    assert_eq!(rows[0][0], Value::Text("2023-06-15".into()));
+}
+
+#[test]
+fn test_time_function() {
+    let mut db = Database::in_memory();
+    let rows = query(&mut db, "SELECT time('2023-06-15 14:30:45');");
+    assert_eq!(rows[0][0], Value::Text("14:30:45".into()));
+}
+
+#[test]
+fn test_datetime_function() {
+    let mut db = Database::in_memory();
+    let rows = query(&mut db, "SELECT datetime('2023-06-15 14:30:45');");
+    assert_eq!(rows[0][0], Value::Text("2023-06-15 14:30:45".into()));
+}
+
+#[test]
+fn test_datetime_with_modifier() {
+    let mut db = Database::in_memory();
+    let rows = query(&mut db, "SELECT datetime('2023-06-15 14:30:00', '+1 day');");
+    assert_eq!(rows[0][0], Value::Text("2023-06-16 14:30:00".into()));
+}
+
+#[test]
+fn test_strftime() {
+    let mut db = Database::in_memory();
+    let rows = query(
+        &mut db,
+        "SELECT strftime('%Y-%m-%d', '2023-06-15 14:30:00');",
+    );
+    assert_eq!(rows[0][0], Value::Text("2023-06-15".into()));
+}
+
+#[test]
+fn test_unixepoch_function() {
+    let mut db = Database::in_memory();
+    let rows = query(&mut db, "SELECT unixepoch('1970-01-01 00:00:00');");
+    assert_eq!(rows[0][0], Value::Integer(0));
+}
+
+#[test]
+fn test_julianday_function() {
+    let mut db = Database::in_memory();
+    let rows = query(&mut db, "SELECT julianday('2000-01-01 12:00:00');");
+    match &rows[0][0] {
+        Value::Real(f) => assert!((*f - 2451545.0).abs() < 0.001),
+        other => panic!("expected Real, got {other:?}"),
+    }
+}
+
+// -- IIF function test --
+
+#[test]
+fn test_iif_function() {
+    let mut db = Database::in_memory();
+    exec(&mut db, "CREATE TABLE t (a INTEGER);");
+    exec(&mut db, "INSERT INTO t VALUES (1);");
+    exec(&mut db, "INSERT INTO t VALUES (0);");
+    exec(&mut db, "INSERT INTO t VALUES (NULL);");
+
+    let rows = query(&mut db, "SELECT iif(a, 'yes', 'no') FROM t ORDER BY rowid;");
+    assert_eq!(rows[0][0], Value::Text("yes".into()));
+    assert_eq!(rows[1][0], Value::Text("no".into()));
+    assert_eq!(rows[2][0], Value::Text("no".into()));
+}
+
+// -- SIGN function test --
+
+#[test]
+fn test_sign_function() {
+    let mut db = Database::in_memory();
+    let rows = query(&mut db, "SELECT sign(-5), sign(0), sign(42);");
+    assert_eq!(rows[0][0], Value::Integer(-1));
+    assert_eq!(rows[0][1], Value::Integer(0));
+    assert_eq!(rows[0][2], Value::Integer(1));
+}
+
+// -- AUTOINCREMENT test --
+
+#[test]
+fn test_autoincrement() {
+    let mut db = Database::in_memory();
+    exec(
+        &mut db,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);",
+    );
+    exec(&mut db, "INSERT INTO t (name) VALUES ('Alice');");
+    exec(&mut db, "INSERT INTO t (name) VALUES ('Bob');");
+    exec(&mut db, "INSERT INTO t (name) VALUES ('Charlie');");
+
+    let rows = query(&mut db, "SELECT id, name FROM t ORDER BY id;");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][0], Value::Integer(1));
+    assert_eq!(rows[1][0], Value::Integer(2));
+    assert_eq!(rows[2][0], Value::Integer(3));
+
+    // Delete all rows and insert again — AUTOINCREMENT should not reuse IDs
+    exec(&mut db, "DELETE FROM t;");
+    exec(&mut db, "INSERT INTO t (name) VALUES ('Dave');");
+
+    let rows = query(&mut db, "SELECT id, name FROM t;");
+    assert_eq!(rows.len(), 1);
+    // Should be 4, not 1 (AUTOINCREMENT prevents reuse)
+    assert_eq!(rows[0][0], Value::Integer(4));
+}

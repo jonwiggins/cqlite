@@ -343,6 +343,36 @@ impl<'a> Parser<'a> {
 
         loop {
             let join_type = match &self.current {
+                Token::Natural => {
+                    self.advance()?;
+                    // NATURAL [LEFT|RIGHT|INNER] JOIN
+                    match &self.current {
+                        Token::Left => {
+                            self.advance()?;
+                            self.eat_if(&Token::Outer)?;
+                            self.expect(&Token::Join)?;
+                            JoinType::NaturalLeft
+                        }
+                        Token::Right => {
+                            self.advance()?;
+                            self.eat_if(&Token::Outer)?;
+                            self.expect(&Token::Join)?;
+                            JoinType::NaturalRight
+                        }
+                        Token::Inner => {
+                            self.advance()?;
+                            self.expect(&Token::Join)?;
+                            JoinType::NaturalInner
+                        }
+                        Token::Join => {
+                            self.advance()?;
+                            JoinType::NaturalInner
+                        }
+                        _ => {
+                            return Err(RsqliteError::Parse("expected JOIN after NATURAL".into()));
+                        }
+                    }
+                }
                 Token::Inner => {
                     self.advance()?;
                     self.expect(&Token::Join)?;
@@ -353,6 +383,12 @@ impl<'a> Parser<'a> {
                     self.eat_if(&Token::Outer)?;
                     self.expect(&Token::Join)?;
                     JoinType::Left
+                }
+                Token::Right => {
+                    self.advance()?;
+                    self.eat_if(&Token::Outer)?;
+                    self.expect(&Token::Join)?;
+                    JoinType::Right
                 }
                 Token::Cross => {
                     self.advance()?;

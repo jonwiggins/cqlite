@@ -12,11 +12,13 @@ This project is a demonstration of modern AI coding tools. Every line of code â€
 - **Full SQL support**: SELECT, INSERT, UPDATE, DELETE, CREATE/DROP TABLE/INDEX, ALTER TABLE, transactions
 - **Hand-written parser**: tokenizer and recursive descent parser with no parser generators
 - **B-tree storage**: B-tree (indexes) and B+tree (tables) with page splitting, merging, and overflow pages
-- **Query execution**: joins (INNER/LEFT/CROSS), subqueries, CTEs (including recursive), aggregates, set operations
+- **Query execution**: joins (INNER/LEFT/RIGHT/CROSS/NATURAL), subqueries, CTEs (including recursive), aggregates, set operations
 - **ACID transactions**: rollback journal with crash recovery and hot journal detection
 - **Automatic indexing**: query planner selects indexes for equality conditions
+- **AUTOINCREMENT**: enforced via `sqlite_sequence` table, preventing rowid reuse
+- **Date/time functions**: `date()`, `time()`, `datetime()`, `julianday()`, `unixepoch()`, `strftime()` with modifiers
 - **Interactive CLI**: REPL with dot-commands (`.tables`, `.schema`, `.mode`, `.dump`, etc.)
-- **438 tests passing** including 5,434 [sqllogictest](https://www.sqlite.org/sqllogictest/doc/trunk/about.wiki) cases at 100% pass rate
+- **461+ tests passing** including 5,434 [sqllogictest](https://www.sqlite.org/sqllogictest/doc/trunk/about.wiki) cases at 100% pass rate
 
 ### SQL coverage
 
@@ -24,24 +26,24 @@ This project is a demonstration of modern AI coding tools. Every line of code â€
 |----------|-----------|
 | DML | SELECT, INSERT (VALUES/SELECT/DEFAULT/multi-row), UPDATE, DELETE |
 | DDL | CREATE/DROP TABLE, CREATE/DROP INDEX, ALTER TABLE (RENAME/ADD/DROP COLUMN) |
-| Expressions | Arithmetic, comparison, BETWEEN, IN, LIKE, IS [NOT] NULL, CASE/WHEN, CAST, EXISTS |
-| Joins | INNER, LEFT, CROSS (nested loop) |
+| Expressions | Arithmetic, comparison, BETWEEN, IN, LIKE, GLOB, IS [NOT] NULL, CASE/WHEN, CAST, EXISTS |
+| Joins | INNER, LEFT, RIGHT, CROSS, NATURAL (nested loop) |
 | Aggregates | COUNT, SUM, AVG, MIN, MAX, GROUP_CONCAT with GROUP BY / HAVING |
 | Set operations | UNION, UNION ALL, INTERSECT, EXCEPT |
 | Subqueries | Scalar, IN, EXISTS (correlated), FROM clause |
 | CTEs | WITH, WITH RECURSIVE |
 | Ordering | ORDER BY (ASC/DESC, multi-column, column numbers, aliases), LIMIT, OFFSET, DISTINCT |
-| Constraints | NOT NULL, DEFAULT, PRIMARY KEY, UNIQUE, CHECK |
+| Constraints | NOT NULL, DEFAULT, PRIMARY KEY, UNIQUE, CHECK, AUTOINCREMENT |
 | Conflict handling | INSERT OR REPLACE/IGNORE/ABORT/FAIL/ROLLBACK |
 | Transactions | BEGIN (DEFERRED/IMMEDIATE/EXCLUSIVE), COMMIT, ROLLBACK, auto-commit |
 | Introspection | EXPLAIN, EXPLAIN QUERY PLAN, PRAGMA |
-| Functions | 20+ built-in scalar and aggregate functions |
+| Functions | 30+ built-in scalar and aggregate functions |
+| Date/time | date, time, datetime, julianday, unixepoch, strftime (with modifiers) |
 
 ### Not yet implemented
 
-- Window functions, RIGHT/FULL OUTER/NATURAL joins, UPSERT, FOREIGN KEY enforcement
+- Window functions, FULL OUTER joins, UPSERT, FOREIGN KEY enforcement
 - WAL mode, concurrent readers, cross-process file locking
-- Date/time functions, AUTOINCREMENT enforcement
 - Join reordering, index range scans, cost-based query planning
 
 ## Getting started
@@ -89,8 +91,8 @@ The test suite includes unit tests across all modules, integration tests, and a 
 
 | Suite | Cases | Pass rate |
 |-------|-------|-----------|
-| Unit tests | 358 | 100% |
-| Integration tests | 77 | 100% |
+| Unit tests | 371 | 100% |
+| Integration tests | 90 | 100% |
 | sqllogictest (basic, select1â€“3) | 5,434 | 100% |
 
 ## Development

@@ -117,6 +117,107 @@ impl Database {
         Ok(empty_result())
     }
 
+    /// Ensure the sqlite_sequence table exists.
+    fn ensure_sqlite_sequence_table(&mut self) -> Result<()> {
+        let schema_entries = schema::read_schema(&mut self.pager)?;
+        let exists = schema_entries
+            .iter()
+            .any(|e| e.entry_type == "table" && e.name.eq_ignore_ascii_case("sqlite_sequence"));
+        if !exists {
+            let ct = crate::parser::parse("CREATE TABLE sqlite_sequence (name TEXT, seq INTEGER)")?;
+            if let Statement::CreateTable(ref ct_stmt) = ct {
+                self.execute_create_table(ct_stmt)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Get the current sequence value for a table from sqlite_sequence.
+    fn get_autoincrement_seq(&mut self, table_name: &str) -> Result<i64> {
+        let schema_entries = schema::read_schema(&mut self.pager)?;
+        let has_seq = schema_entries
+            .iter()
+            .any(|e| e.entry_type == "table" && e.name.eq_ignore_ascii_case("sqlite_sequence"));
+        if !has_seq {
+            return Ok(0); // No sqlite_sequence table yet
+        }
+
+        let table_schemas = build_table_schemas(&schema_entries)?;
+        let seq_schema = table_schemas
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case("sqlite_sequence"));
+        let seq_schema = match seq_schema {
+            Some(s) => s,
+            None => return Ok(0),
+        };
+
+        // Scan sqlite_sequence for our table name.
+        let rows = vm::scan_table(&mut self.pager, seq_schema)?;
+        for (_rowid, values) in &rows {
+            if let Some(Value::Text(name)) = values.first() {
+                if name.eq_ignore_ascii_case(table_name) {
+                    if let Some(Value::Integer(seq)) = values.get(1) {
+                        return Ok(*seq);
+                    }
+                }
+            }
+        }
+        Ok(0)
+    }
+
+    /// Update the sqlite_sequence value for a table.
+    fn update_autoincrement_seq(&mut self, table_name: &str, rowid: i64) -> Result<()> {
+        self.ensure_sqlite_sequence_table()?;
+
+        let schema_entries = schema::read_schema(&mut self.pager)?;
+        let table_schemas = build_table_schemas(&schema_entries)?;
+        let seq_schema = table_schemas
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case("sqlite_sequence"))
+            .ok_or_else(|| RsqliteError::Runtime("sqlite_sequence table not found".into()))?
+            .clone();
+
+        // Find existing row for this table.
+        let rows = vm::scan_table(&mut self.pager, &seq_schema)?;
+        let mut found = false;
+        for (seq_rowid, values) in &rows {
+            if let Some(Value::Text(name)) = values.first() {
+                if name.eq_ignore_ascii_case(table_name) {
+                    // Only update if new rowid is larger.
+                    let current_seq = match values.get(1) {
+                        Some(Value::Integer(n)) => *n,
+                        _ => 0,
+                    };
+                    if rowid > current_seq {
+                        let new_values =
+                            vec![Value::Text(table_name.to_string()), Value::Integer(rowid)];
+                        let payload = record::encode_record(&new_values);
+                        btree::btree_delete(&mut self.pager, seq_schema.root_page, *seq_rowid)?;
+                        btree::btree_insert(
+                            &mut self.pager,
+                            seq_schema.root_page,
+                            *seq_rowid,
+                            &payload,
+                        )?;
+                    }
+                    found = true;
+                    break;
+                }
+            }
+        }
+
+        if !found {
+            // Insert new row.
+            let seq_root = seq_schema.root_page;
+            let new_rowid = btree::find_max_rowid(&mut self.pager, seq_root)? + 1;
+            let new_values = vec![Value::Text(table_name.to_string()), Value::Integer(rowid)];
+            let payload = record::encode_record(&new_values);
+            btree::btree_insert(&mut self.pager, seq_root, new_rowid, &payload)?;
+        }
+
+        Ok(())
+    }
+
     /// Execute COMMIT.
     fn execute_commit(&mut self) -> Result<QueryResult> {
         if !self.in_transaction {
@@ -284,9 +385,14 @@ impl Database {
                     }
                     Value::Null => {
                         // Auto-assign rowid.
-
-                        // Keep NULL in the record.
-                        btree::find_max_rowid(&mut self.pager, root_page)? + 1
+                        let max_rowid = btree::find_max_rowid(&mut self.pager, root_page)?;
+                        if schema.autoincrement {
+                            // For AUTOINCREMENT, use max(sqlite_sequence, max_rowid) + 1
+                            let seq = self.get_autoincrement_seq(&schema.name)?;
+                            std::cmp::max(max_rowid, seq) + 1
+                        } else {
+                            max_rowid + 1
+                        }
                     }
                     _ => {
                         // Try to convert to integer.
@@ -443,6 +549,11 @@ impl Database {
                     &full_values,
                     rowid,
                 )?;
+            }
+
+            // Update sqlite_sequence for AUTOINCREMENT tables.
+            if schema.autoincrement {
+                self.update_autoincrement_seq(&schema.name, rowid)?;
             }
 
             changes += 1;
@@ -1169,6 +1280,7 @@ fn build_table_schemas(entries: &[SchemaEntry]) -> Result<Vec<TableSchema>> {
             FullTableInfo {
                 columns: vec![],
                 rowid_column: None,
+                autoincrement: false,
                 constraints: vec![],
                 check_constraints: Vec::new(),
             }
@@ -1199,6 +1311,7 @@ fn build_table_schemas(entries: &[SchemaEntry]) -> Result<Vec<TableSchema>> {
             columns: info.columns,
             root_page: entry.rootpage as u32,
             rowid_column: info.rowid_column,
+            autoincrement: info.autoincrement,
             column_constraints: info.constraints,
             check_constraints: info.check_constraints,
             indexes,
@@ -1415,6 +1528,7 @@ fn delete_from_indexes(pager: &mut Pager, indexes: &[IndexSchema], table_rowid: 
 struct FullTableInfo {
     columns: Vec<String>,
     rowid_column: Option<usize>,
+    autoincrement: bool,
     constraints: Vec<vm::ColumnConstraints>,
     check_constraints: Vec<crate::ast::Expr>,
 }
@@ -1425,11 +1539,13 @@ fn extract_table_info(sql: &str) -> FullTableInfo {
     if let Ok(Statement::CreateTable(ct)) = crate::parser::parse(sql) {
         let columns: Vec<String> = ct.columns.iter().map(|c| c.name.clone()).collect();
         let rowid_col = find_integer_primary_key(&ct);
+        let autoincrement = has_autoincrement(&ct);
         let constraints = extract_constraints(&ct, rowid_col);
         let check_constraints = extract_check_constraints(&ct);
         return FullTableInfo {
             columns,
             rowid_column: rowid_col,
+            autoincrement,
             constraints,
             check_constraints,
         };
@@ -1442,6 +1558,7 @@ fn extract_table_info(sql: &str) -> FullTableInfo {
     FullTableInfo {
         columns,
         rowid_column: rowid_col,
+        autoincrement: false,
         constraints,
         check_constraints: Vec::new(),
     }
@@ -1519,6 +1636,21 @@ fn find_integer_primary_key(ct: &crate::ast::CreateTableStatement) -> Option<usi
         }
     }
     None
+}
+
+/// Check if any column has AUTOINCREMENT.
+fn has_autoincrement(ct: &crate::ast::CreateTableStatement) -> bool {
+    ct.columns.iter().any(|col| {
+        col.constraints.iter().any(|c| {
+            matches!(
+                c,
+                crate::ast::ColumnConstraint::PrimaryKey {
+                    autoincrement: true,
+                    ..
+                }
+            )
+        })
+    })
 }
 
 /// Text-based detection of INTEGER PRIMARY KEY column.
@@ -1933,6 +2065,7 @@ fn execute_pragma(pragma: &crate::ast::PragmaStatement, pager: &mut Pager) -> Re
                 FullTableInfo {
                     columns: vec![],
                     rowid_column: None,
+                    autoincrement: false,
                     constraints: vec![],
                     check_constraints: Vec::new(),
                 }

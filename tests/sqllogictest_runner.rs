@@ -458,7 +458,6 @@ fn test_sqllogictest_suite_summary() {
         .filter(|e| {
             let p = e.path();
             p.extension().map(|ext| ext == "test").unwrap_or(false)
-                && p.file_name().map(|n| n != "select5.test").unwrap_or(true)
         })
         .collect();
     entries.sort_by_key(|e| e.path());

@@ -51,6 +51,8 @@ pub struct TableSchema {
     /// When set, this column's value is not stored in the record payload but
     /// is instead the rowid of the B-tree entry.
     pub rowid_column: Option<usize>,
+    /// Whether the INTEGER PRIMARY KEY column has AUTOINCREMENT.
+    pub autoincrement: bool,
     /// Per-column constraints (parallel to `columns`).
     pub column_constraints: Vec<ColumnConstraints>,
     /// CHECK constraint expressions to evaluate on INSERT/UPDATE.
@@ -79,7 +81,7 @@ pub struct QueryResult {
 }
 
 /// Scan all rows from a table, handling INTEGER PRIMARY KEY substitution.
-fn scan_table(pager: &mut Pager, schema: &TableSchema) -> Result<Vec<(i64, Vec<Value>)>> {
+pub fn scan_table(pager: &mut Pager, schema: &TableSchema) -> Result<Vec<(i64, Vec<Value>)>> {
     let mut rows = Vec::new();
     let mut cursor = BTreeCursor::new(schema.root_page);
     cursor.move_to_first(pager)?;
@@ -504,37 +506,62 @@ fn execute_select_with_ctes(
 
             let right_rows = scan_table(pager, right_schema)?;
 
+            // Determine if this is a NATURAL join (resolve shared columns).
+            let is_natural = matches!(
+                join.join_type,
+                JoinType::NaturalInner | JoinType::NaturalLeft | JoinType::NaturalRight
+            );
+
+            // For NATURAL joins, build USING columns from shared column names.
             // For USING clause, find the common column indices.
-            let using_cols: Option<Vec<(usize, usize)>> = match &join.constraint {
-                Some(JoinConstraint::Using(cols)) => {
-                    let mut pairs = Vec::new();
-                    for col_name in cols {
-                        // Left columns are qualified; search by bare name.
-                        let left_idx = combined_columns
-                            .iter()
-                            .position(|c| {
-                                let bare = c.rfind('.').map(|p| &c[p + 1..]).unwrap_or(c);
-                                bare.eq_ignore_ascii_case(col_name)
-                            })
-                            .ok_or_else(|| {
-                                RsqliteError::Runtime(format!(
-                                    "column {col_name} not found in left table"
-                                ))
-                            })?;
-                        let right_idx = right_schema
-                            .columns
-                            .iter()
-                            .position(|c| c.eq_ignore_ascii_case(col_name))
-                            .ok_or_else(|| {
-                                RsqliteError::Runtime(format!(
-                                    "column {col_name} not found in table {right_name}"
-                                ))
-                            })?;
-                        pairs.push((left_idx, right_idx));
+            let using_cols: Option<Vec<(usize, usize)>> = if is_natural {
+                // Find columns that appear in both left and right tables.
+                let mut pairs = Vec::new();
+                for (ri, right_col) in right_schema.columns.iter().enumerate() {
+                    if let Some(li) = combined_columns.iter().position(|c| {
+                        let bare = c.rfind('.').map(|p| &c[p + 1..]).unwrap_or(c);
+                        bare.eq_ignore_ascii_case(right_col)
+                    }) {
+                        pairs.push((li, ri));
                     }
+                }
+                if pairs.is_empty() {
+                    None // No shared columns — behaves like CROSS JOIN
+                } else {
                     Some(pairs)
                 }
-                _ => None,
+            } else {
+                match &join.constraint {
+                    Some(JoinConstraint::Using(cols)) => {
+                        let mut pairs = Vec::new();
+                        for col_name in cols {
+                            // Left columns are qualified; search by bare name.
+                            let left_idx = combined_columns
+                                .iter()
+                                .position(|c| {
+                                    let bare = c.rfind('.').map(|p| &c[p + 1..]).unwrap_or(c);
+                                    bare.eq_ignore_ascii_case(col_name)
+                                })
+                                .ok_or_else(|| {
+                                    RsqliteError::Runtime(format!(
+                                        "column {col_name} not found in left table"
+                                    ))
+                                })?;
+                            let right_idx = right_schema
+                                .columns
+                                .iter()
+                                .position(|c| c.eq_ignore_ascii_case(col_name))
+                                .ok_or_else(|| {
+                                    RsqliteError::Runtime(format!(
+                                        "column {col_name} not found in table {right_name}"
+                                    ))
+                                })?;
+                            pairs.push((left_idx, right_idx));
+                        }
+                        Some(pairs)
+                    }
+                    _ => None,
+                }
             };
 
             // Build combined columns (for USING, skip duplicate columns from right).
@@ -579,20 +606,32 @@ fn execute_select_with_ctes(
                     }
 
                     // Check join condition.
-                    let passes = match &join.constraint {
-                        Some(JoinConstraint::On(expr)) => {
-                            let result =
-                                eval_expr(expr, &all_columns, &combined_values, *left_rowid, None)?;
-                            result.is_truthy()
+                    let passes = if let (true, Some(pairs)) = (is_natural, using_cols.as_ref()) {
+                        // NATURAL JOIN: match on shared columns.
+                        pairs.iter().all(|&(left_idx, right_idx)| {
+                            left_values.get(left_idx) == right_values.get(right_idx)
+                        })
+                    } else {
+                        match &join.constraint {
+                            Some(JoinConstraint::On(expr)) => {
+                                let result = eval_expr(
+                                    expr,
+                                    &all_columns,
+                                    &combined_values,
+                                    *left_rowid,
+                                    None,
+                                )?;
+                                result.is_truthy()
+                            }
+                            Some(JoinConstraint::Using(_)) => {
+                                // Check that the USING columns match.
+                                let pairs = using_cols.as_ref().unwrap();
+                                pairs.iter().all(|&(left_idx, right_idx)| {
+                                    left_values.get(left_idx) == right_values.get(right_idx)
+                                })
+                            }
+                            None => true, // CROSS JOIN
                         }
-                        Some(JoinConstraint::Using(_)) => {
-                            // Check that the USING columns match.
-                            let pairs = using_cols.as_ref().unwrap();
-                            pairs.iter().all(|&(left_idx, right_idx)| {
-                                left_values.get(left_idx) == right_values.get(right_idx)
-                            })
-                        }
-                        None => true, // CROSS JOIN
                     };
 
                     if !passes {
@@ -614,13 +653,48 @@ fn execute_select_with_ctes(
                 }
 
                 // LEFT JOIN: if no match, include left row with NULLs for right columns.
-                if !matched && join.join_type == JoinType::Left {
+                let is_left = matches!(join.join_type, JoinType::Left | JoinType::NaturalLeft);
+                if !matched && is_left {
                     let mut combined_values = left_values.clone();
                     let extra_cols = combined_columns.len() - right_col_start;
                     for _ in 0..extra_cols {
                         combined_values.push(Value::Null);
                     }
                     new_rows.push((*left_rowid, combined_values));
+                }
+            }
+
+            // RIGHT JOIN: for unmatched right rows, include with NULLs for left columns.
+            let is_right = matches!(join.join_type, JoinType::Right | JoinType::NaturalRight);
+            if is_right {
+                // Find which right rows were NOT matched.
+                for (right_rowid, right_values) in &right_rows {
+                    let mut was_matched = false;
+                    for (_, combined_vals) in &new_rows {
+                        // Check if this right row appears in any combined row.
+                        // Compare the right portion of the combined row.
+                        let right_portion: Vec<&Value> = right_values
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| !skip_right_cols[*i])
+                            .map(|(_, v)| v)
+                            .collect();
+                        let combined_right: Vec<&Value> =
+                            combined_vals[right_col_start..].iter().collect();
+                        if right_portion == combined_right {
+                            was_matched = true;
+                            break;
+                        }
+                    }
+                    if !was_matched {
+                        let mut combined_values: Vec<Value> = vec![Value::Null; right_col_start];
+                        for (i, val) in right_values.iter().enumerate() {
+                            if !skip_right_cols[i] {
+                                combined_values.push(val.clone());
+                            }
+                        }
+                        new_rows.push((*right_rowid, combined_values));
+                    }
                 }
             }
 
@@ -819,6 +893,8 @@ fn execute_select_with_ctes(
                             .iter()
                             .any(|r| rows_equal(&r.values, &row.values))
                     });
+                    // INTERSECT produces distinct results.
+                    dedup_rows(&mut result_rows);
                 }
                 crate::ast::CompoundOp::Except => {
                     result_rows.retain(|row| {
@@ -827,6 +903,8 @@ fn execute_select_with_ctes(
                             .iter()
                             .any(|r| rows_equal(&r.values, &row.values))
                     });
+                    // EXCEPT produces distinct results.
+                    dedup_rows(&mut result_rows);
                 }
             }
         }
@@ -990,6 +1068,19 @@ fn rows_equal(a: &[Value], b: &[Value]) -> bool {
     a.iter()
         .zip(b.iter())
         .all(|(va, vb)| crate::types::sqlite_cmp(va, vb) == std::cmp::Ordering::Equal)
+}
+
+/// Remove duplicate rows in-place.
+fn dedup_rows(rows: &mut Vec<Row>) {
+    let mut seen = Vec::new();
+    rows.retain(|row| {
+        if seen.iter().any(|s: &Vec<Value>| rows_equal(s, &row.values)) {
+            false
+        } else {
+            seen.push(row.values.clone());
+            true
+        }
+    });
 }
 
 /// Split a WHERE expression into AND-connected terms for predicate pushdown.

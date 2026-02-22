@@ -111,7 +111,12 @@ pub struct JoinClause {
 pub enum JoinType {
     Inner,
     Left,
+    Right,
     Cross,
+    /// NATURAL is a modifier — the actual join type is stored here.
+    NaturalInner,
+    NaturalLeft,
+    NaturalRight,
 }
 
 #[derive(Debug, Clone, PartialEq)]

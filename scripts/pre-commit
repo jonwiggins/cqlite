@@ -1,44 +1,16 @@
 #!/bin/sh
-# Pre-commit hook: ensure the project builds and tests pass before committing.
+set -e
 
-export PATH="$HOME/.cargo/bin:$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
+# Ensure cargo is on PATH
+export PATH="$HOME/.cargo/bin:$PATH"
 
-# Try cargo fmt if available.
-if cargo fmt --version > /dev/null 2>&1; then
-    echo "Running cargo fmt --check..."
-    cargo fmt --check
-    if [ $? -ne 0 ]; then
-        echo ""
-        echo "ERROR: cargo fmt check failed. Run 'cargo fmt' to fix formatting."
-        exit 1
-    fi
-fi
+echo "==> cargo fmt --check"
+cargo fmt --all --check
 
-# Try clippy if available, otherwise fall back to build with warnings denied.
-if cargo clippy --version > /dev/null 2>&1; then
-    echo "Running cargo clippy..."
-    cargo clippy -- -D warnings
-    if [ $? -ne 0 ]; then
-        echo ""
-        echo "ERROR: cargo clippy found warnings/errors. Fix them before committing."
-        exit 1
-    fi
-else
-    echo "Running cargo build..."
-    RUSTFLAGS="-D warnings" cargo build 2>&1
-    if [ $? -ne 0 ]; then
-        echo ""
-        echo "ERROR: build failed or has warnings. Fix before committing."
-        exit 1
-    fi
-fi
+echo "==> cargo clippy"
+cargo clippy --all-targets --all-features -- -D warnings
 
-echo "Running cargo test..."
-cargo test 2>&1
-if [ $? -ne 0 ]; then
-    echo ""
-    echo "ERROR: tests failed. Fix before committing."
-    exit 1
-fi
+echo "==> cargo test"
+cargo test --all-targets
 
-echo "Pre-commit checks passed."
+echo "All pre-commit checks passed."

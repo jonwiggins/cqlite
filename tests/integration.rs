@@ -1075,3 +1075,349 @@ fn test_case_when_with_subquery() {
         2
     );
 }
+
+// ---- Index-based query execution ----
+
+#[test]
+fn test_index_scan_equality() {
+    let mut db = Database::in_memory();
+    exec(&mut db, "CREATE TABLE t (a INTEGER, b TEXT, c INTEGER);");
+    for i in 1..=100 {
+        exec(
+            &mut db,
+            &format!("INSERT INTO t VALUES ({i}, 'val{i}', {});", i * 10),
+        );
+    }
+    exec(&mut db, "CREATE INDEX idx_a ON t(a);");
+
+    // Query using the index on column a.
+    let rows = query(&mut db, "SELECT b FROM t WHERE a = 42;");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Text("val42".into()));
+}
+
+#[test]
+fn test_index_scan_multi_column() {
+    let mut db = Database::in_memory();
+    exec(&mut db, "CREATE TABLE t (a INTEGER, b TEXT, c INTEGER);");
+    exec(&mut db, "INSERT INTO t VALUES (1, 'x', 10);");
+    exec(&mut db, "INSERT INTO t VALUES (1, 'y', 20);");
+    exec(&mut db, "INSERT INTO t VALUES (2, 'x', 30);");
+    exec(&mut db, "INSERT INTO t VALUES (2, 'y', 40);");
+    exec(&mut db, "CREATE INDEX idx_ab ON t(a, b);");
+
+    // Should use the index to narrow results on both a and b.
+    let rows = query(&mut db, "SELECT c FROM t WHERE a = 1 AND b = 'y';");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Integer(20));
+}
+
+#[test]
+fn test_index_scan_no_match() {
+    let mut db = Database::in_memory();
+    exec(&mut db, "CREATE TABLE t (a INTEGER, b TEXT);");
+    exec(&mut db, "INSERT INTO t VALUES (1, 'one');");
+    exec(&mut db, "INSERT INTO t VALUES (2, 'two');");
+    exec(&mut db, "CREATE INDEX idx_a ON t(a);");
+
+    let rows = query(&mut db, "SELECT b FROM t WHERE a = 99;");
+    assert_eq!(rows.len(), 0);
+}
+
+#[test]
+fn test_from_subquery_basic() {
+    let mut db = Database::in_memory();
+    exec(&mut db, "CREATE TABLE t (a INTEGER, b TEXT);");
+    exec(&mut db, "INSERT INTO t VALUES (1, 'one');");
+    exec(&mut db, "INSERT INTO t VALUES (2, 'two');");
+    exec(&mut db, "INSERT INTO t VALUES (3, 'three');");
+
+    let rows = query(
+        &mut db,
+        "SELECT * FROM (SELECT a, b FROM t WHERE a > 1) AS sub;",
+    );
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn test_from_subquery_with_alias() {
+    let mut db = Database::in_memory();
+    exec(&mut db, "CREATE TABLE t (a INTEGER, b INTEGER);");
+    exec(&mut db, "INSERT INTO t VALUES (1, 10);");
+    exec(&mut db, "INSERT INTO t VALUES (2, 20);");
+
+    let rows = query(
+        &mut db,
+        "SELECT sub.total FROM (SELECT a + b AS total FROM t) AS sub ORDER BY 1;",
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0], Value::Integer(11));
+    assert_eq!(rows[1][0], Value::Integer(22));
+}
+
+#[test]
+fn test_from_subquery_with_where() {
+    let mut db = Database::in_memory();
+    exec(&mut db, "CREATE TABLE t (a INTEGER);");
+    exec(&mut db, "INSERT INTO t VALUES (1);");
+    exec(&mut db, "INSERT INTO t VALUES (2);");
+    exec(&mut db, "INSERT INTO t VALUES (3);");
+
+    let rows = query(
+        &mut db,
+        "SELECT a FROM (SELECT a FROM t) AS sub WHERE a >= 2;",
+    );
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn test_unique_constraint_enforced() {
+    let mut db = Database::in_memory();
+    exec(&mut db, "CREATE TABLE t (a INTEGER, b TEXT);");
+    exec(&mut db, "CREATE UNIQUE INDEX idx_a ON t(a);");
+    exec(&mut db, "INSERT INTO t VALUES (1, 'first');");
+
+    // Should fail: duplicate value on UNIQUE column.
+    let result = db.execute("INSERT INTO t VALUES (1, 'second');");
+    assert!(result.is_err());
+    let err = format!("{}", result.unwrap_err());
+    assert!(err.contains("UNIQUE constraint failed"));
+
+    // Different value should succeed.
+    exec(&mut db, "INSERT INTO t VALUES (2, 'second');");
+    let rows = query(&mut db, "SELECT count(*) FROM t;");
+    assert_eq!(rows[0][0], Value::Integer(2));
+}
+
+#[test]
+fn test_unique_constraint_allows_null() {
+    let mut db = Database::in_memory();
+    exec(&mut db, "CREATE TABLE t (a INTEGER, b TEXT);");
+    exec(&mut db, "CREATE UNIQUE INDEX idx_a ON t(a);");
+    exec(&mut db, "INSERT INTO t VALUES (NULL, 'first');");
+    exec(&mut db, "INSERT INTO t VALUES (NULL, 'second');");
+
+    // Multiple NULLs should be allowed in a UNIQUE column.
+    let rows = query(&mut db, "SELECT count(*) FROM t;");
+    assert_eq!(rows[0][0], Value::Integer(2));
+}
+
+#[test]
+fn test_index_scan_with_additional_where() {
+    let mut db = Database::in_memory();
+    exec(&mut db, "CREATE TABLE t (a INTEGER, b INTEGER, c TEXT);");
+    exec(&mut db, "INSERT INTO t VALUES (1, 10, 'keep');");
+    exec(&mut db, "INSERT INTO t VALUES (1, 20, 'drop');");
+    exec(&mut db, "INSERT INTO t VALUES (2, 10, 'other');");
+    exec(&mut db, "CREATE INDEX idx_a ON t(a);");
+
+    // Index narrows to a=1, then WHERE also filters b=10.
+    let rows = query(&mut db, "SELECT c FROM t WHERE a = 1 AND b = 10;");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Text("keep".into()));
+}
+
+// -- CHECK constraint tests --
+
+#[test]
+fn test_check_constraint_column_level() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER CHECK(age >= 0))")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 25)").unwrap();
+    // Negative age should fail.
+    let err = db.execute("INSERT INTO t VALUES (2, -1)");
+    assert!(err.is_err());
+    assert!(
+        format!("{:?}", err).contains("CHECK"),
+        "expected CHECK constraint error"
+    );
+    // Verify the valid row was inserted.
+    let rows = query(&mut db, "SELECT age FROM t");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Integer(25));
+}
+
+#[test]
+fn test_check_constraint_table_level() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (a INTEGER, b INTEGER, CHECK(a < b))")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    // a >= b should fail.
+    let err = db.execute("INSERT INTO t VALUES (10, 5)");
+    assert!(err.is_err());
+    let rows = query(&mut db, "SELECT * FROM t");
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn test_check_constraint_on_update() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER CHECK(val > 0))")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    // Valid update.
+    db.execute("UPDATE t SET val = 5 WHERE id = 1").unwrap();
+    // Invalid update should fail.
+    let err = db.execute("UPDATE t SET val = 0 WHERE id = 1");
+    assert!(err.is_err());
+    // Value should still be 5.
+    let rows = query(&mut db, "SELECT val FROM t WHERE id = 1");
+    assert_eq!(rows[0][0], Value::Integer(5));
+}
+
+#[test]
+fn test_check_constraint_null_passes() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER CHECK(val > 0))")
+        .unwrap();
+    // NULL should pass CHECK (per SQL standard: NULL is not false).
+    db.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
+    let rows = query(&mut db, "SELECT val FROM t");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Null);
+}
+
+// -- INSERT OR REPLACE / INSERT OR IGNORE tests --
+
+#[test]
+fn test_insert_or_replace_pk_conflict() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'alice')").unwrap();
+    db.execute("INSERT OR REPLACE INTO t VALUES (1, 'bob')")
+        .unwrap();
+    let rows = query(&mut db, "SELECT name FROM t WHERE id = 1");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Text("bob".into()));
+    // Should only have 1 row total.
+    let all = query(&mut db, "SELECT * FROM t");
+    assert_eq!(all.len(), 1);
+}
+
+#[test]
+fn test_insert_or_ignore_pk_conflict() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'alice')").unwrap();
+    db.execute("INSERT OR IGNORE INTO t VALUES (1, 'bob')")
+        .unwrap();
+    let rows = query(&mut db, "SELECT name FROM t WHERE id = 1");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Text("alice".into()));
+}
+
+#[test]
+fn test_replace_into_syntax() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'old')").unwrap();
+    db.execute("REPLACE INTO t VALUES (1, 'new')").unwrap();
+    let rows = query(&mut db, "SELECT val FROM t WHERE id = 1");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Text("new".into()));
+}
+
+#[test]
+fn test_insert_or_replace_unique_index() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT)")
+        .unwrap();
+    db.execute("CREATE UNIQUE INDEX idx_email ON t(email)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a@b.com')").unwrap();
+    // Insert new row that conflicts on UNIQUE email.
+    db.execute("INSERT OR REPLACE INTO t VALUES (2, 'a@b.com')")
+        .unwrap();
+    // Old row (id=1) should have been deleted, new row (id=2) exists.
+    let rows = query(&mut db, "SELECT id, email FROM t");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Integer(2));
+    assert_eq!(rows[0][1], Value::Text("a@b.com".into()));
+}
+
+#[test]
+fn test_insert_or_ignore_unique_index() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT)")
+        .unwrap();
+    db.execute("CREATE UNIQUE INDEX idx_email ON t(email)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a@b.com')").unwrap();
+    db.execute("INSERT OR IGNORE INTO t VALUES (2, 'a@b.com')")
+        .unwrap();
+    // Original row should remain.
+    let rows = query(&mut db, "SELECT id FROM t");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Integer(1));
+}
+
+// -- CTE tests --
+
+#[test]
+fn test_cte_basic() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    db.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+
+    let rows = query(
+        &mut db,
+        "WITH cte AS (SELECT id, val FROM t WHERE id = 1) SELECT * FROM cte",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Integer(1));
+    assert_eq!(rows[0][1], Value::Text("a".into()));
+}
+
+#[test]
+fn test_cte_with_column_names() {
+    let mut db = Database::in_memory();
+
+    let rows = query(&mut db, "WITH nums(x) AS (SELECT 42) SELECT x FROM nums");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Integer(42));
+}
+
+#[test]
+fn test_cte_multiple() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+
+    let rows = query(
+        &mut db,
+        "WITH a AS (SELECT val FROM t WHERE id = 1), \
+              b AS (SELECT val FROM t WHERE id = 2) \
+         SELECT * FROM a",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Integer(10));
+}
+
+#[test]
+fn test_cte_recursive() {
+    let mut db = Database::in_memory();
+
+    let rows = query(
+        &mut db,
+        "WITH RECURSIVE cnt(x) AS (\
+             SELECT 1 \
+             UNION ALL \
+             SELECT x + 1 FROM cnt WHERE x < 5\
+         ) SELECT x FROM cnt",
+    );
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows[0][0], Value::Integer(1));
+    assert_eq!(rows[1][0], Value::Integer(2));
+    assert_eq!(rows[2][0], Value::Integer(3));
+    assert_eq!(rows[3][0], Value::Integer(4));
+    assert_eq!(rows[4][0], Value::Integer(5));
+}

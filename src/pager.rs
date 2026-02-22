@@ -221,8 +221,19 @@ impl Pager {
     }
 
     /// Allocate a new page, returning its page number.
+    /// Reuses freelist pages when available, otherwise extends the database.
     pub fn allocate_page(&mut self) -> Result<PageNumber> {
-        // TODO: Check freelist first.
+        // Check the freelist first.
+        if self.header.first_freelist_page != 0 && self.header.freelist_count > 0 {
+            if let Some(page_num) = self.pop_freelist_page()? {
+                // Zero out the page for fresh use.
+                let page = Page::new(page_num, self.page_size);
+                self.cache.insert(page_num, page);
+                self.lru.push(page_num);
+                return Ok(page_num);
+            }
+        }
+
         self.header.page_count += 1;
         let page_num = self.header.page_count;
 
@@ -231,6 +242,80 @@ impl Pager {
         self.lru.push(page_num);
 
         Ok(page_num)
+    }
+
+    /// Add a page to the freelist for later reuse.
+    pub fn free_page(&mut self, page_num: PageNumber) -> Result<()> {
+        // Simple freelist: each freed page becomes a trunk page that points to
+        // the previous first trunk page. This is a singly-linked list of trunk pages.
+        // Each trunk page stores: [next_trunk_page (4 bytes), leaf_count (4 bytes), leaf_pages...]
+        // For simplicity, we just chain trunk pages with 0 leaves each.
+        let old_first = self.header.first_freelist_page;
+        let page = self.get_page_mut(page_num)?;
+        let data = &mut page.data;
+        // Zero the page.
+        for b in data.iter_mut() {
+            *b = 0;
+        }
+        // Write the next trunk pointer (the old first freelist page).
+        data[0] = (old_first >> 24) as u8;
+        data[1] = (old_first >> 16) as u8;
+        data[2] = (old_first >> 8) as u8;
+        data[3] = old_first as u8;
+        // Leaf count = 0 (this is a trunk page with no leaves).
+        // Bytes 4..8 are already 0.
+        page.dirty = true;
+
+        self.header.first_freelist_page = page_num;
+        self.header.freelist_count += 1;
+        Ok(())
+    }
+
+    /// Pop a page from the freelist. Returns None if the freelist is empty.
+    fn pop_freelist_page(&mut self) -> Result<Option<PageNumber>> {
+        let trunk_page = self.header.first_freelist_page;
+        if trunk_page == 0 {
+            return Ok(None);
+        }
+
+        // Read the trunk page to find the next trunk pointer.
+        let data = self.get_page(trunk_page)?.data.clone();
+        let next_trunk = ((data[0] as u32) << 24)
+            | ((data[1] as u32) << 16)
+            | ((data[2] as u32) << 8)
+            | (data[3] as u32);
+
+        // Check if this trunk has leaf pages we should return first.
+        let leaf_count = ((data[4] as u32) << 24)
+            | ((data[5] as u32) << 16)
+            | ((data[6] as u32) << 8)
+            | (data[7] as u32);
+
+        if leaf_count > 0 {
+            // Return the last leaf page.
+            let offset = 8 + ((leaf_count - 1) * 4) as usize;
+            let leaf_page = ((data[offset] as u32) << 24)
+                | ((data[offset + 1] as u32) << 16)
+                | ((data[offset + 2] as u32) << 8)
+                | (data[offset + 3] as u32);
+
+            // Decrement the leaf count in the trunk page.
+            let new_count = leaf_count - 1;
+            let page = self.get_page_mut(trunk_page)?;
+            page.data[4] = (new_count >> 24) as u8;
+            page.data[5] = (new_count >> 16) as u8;
+            page.data[6] = (new_count >> 8) as u8;
+            page.data[7] = new_count as u8;
+            page.dirty = true;
+
+            self.header.freelist_count -= 1;
+            return Ok(Some(leaf_page));
+        }
+
+        // No leaves — return the trunk page itself.
+        self.header.first_freelist_page = next_trunk;
+        self.header.freelist_count -= 1;
+        Ok(Some(trunk_page))
     }
 
     /// Rollback: restore pages from the journal and discard dirty cache entries.

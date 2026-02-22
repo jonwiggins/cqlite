@@ -82,6 +82,9 @@ impl<'a> Parser<'a> {
             Token::Select => self
                 .parse_select_statement()
                 .map(|s| Statement::Select(Box::new(s))),
+            Token::With => self
+                .parse_with_select()
+                .map(|s| Statement::Select(Box::new(s))),
             Token::Insert | Token::Replace => self.parse_insert_statement().map(Statement::Insert),
             Token::Update => self.parse_update_statement().map(Statement::Update),
             Token::Delete => self.parse_delete_statement().map(Statement::Delete),
@@ -113,6 +116,50 @@ impl<'a> Parser<'a> {
     // -------------------------------------------------------------------------
     // SELECT
     // -------------------------------------------------------------------------
+
+    /// Parse WITH ... SELECT (common table expressions).
+    fn parse_with_select(&mut self) -> Result<SelectStatement> {
+        self.expect(&Token::With)?;
+
+        let is_recursive = self.eat_if(&Token::Recursive)?;
+
+        let mut ctes = Vec::new();
+        loop {
+            let name = self.parse_identifier()?;
+
+            // Optional column list: WITH name(col1, col2, ...) AS (...)
+            let columns = if self.eat_if(&Token::LeftParen)? {
+                let mut cols = vec![self.parse_identifier()?];
+                while self.eat_if(&Token::Comma)? {
+                    cols.push(self.parse_identifier()?);
+                }
+                self.expect(&Token::RightParen)?;
+                Some(cols)
+            } else {
+                None
+            };
+
+            self.expect(&Token::As)?;
+            self.expect(&Token::LeftParen)?;
+            let query = self.parse_select_statement()?;
+            self.expect(&Token::RightParen)?;
+
+            ctes.push(Cte {
+                name,
+                columns,
+                query: Box::new(query),
+                recursive: is_recursive,
+            });
+
+            if !self.eat_if(&Token::Comma)? {
+                break;
+            }
+        }
+
+        let mut select = self.parse_select_statement()?;
+        select.ctes = ctes;
+        Ok(select)
+    }
 
     fn parse_select_statement(&mut self) -> Result<SelectStatement> {
         self.expect(&Token::Select)?;
@@ -182,6 +229,7 @@ impl<'a> Parser<'a> {
                         offset: Some(offset),
                     }),
                     compound: vec![],
+                    ctes: vec![],
                 });
             } else {
                 None
@@ -229,6 +277,7 @@ impl<'a> Parser<'a> {
             order_by,
             limit,
             compound,
+            ctes: vec![],
         })
     }
 
@@ -421,7 +470,31 @@ impl<'a> Parser<'a> {
 
     fn parse_insert_statement(&mut self) -> Result<InsertStatement> {
         // Consume INSERT or REPLACE
+        let is_replace = self.current == Token::Replace;
         self.advance()?;
+
+        // Parse OR conflict-resolution if present: INSERT OR REPLACE/IGNORE/ABORT/FAIL/ROLLBACK
+        let or_conflict = if is_replace {
+            Some(ConflictResolution::Replace)
+        } else if self.eat_if(&Token::Or)? {
+            let resolution = match &self.current {
+                Token::Replace => ConflictResolution::Replace,
+                Token::Ignore => ConflictResolution::Ignore,
+                Token::Abort => ConflictResolution::Abort,
+                Token::Fail => ConflictResolution::Fail,
+                Token::Rollback => ConflictResolution::Rollback,
+                _ => {
+                    return Err(RsqliteError::Parse(
+                        "expected REPLACE, IGNORE, ABORT, FAIL, or ROLLBACK after INSERT OR".into(),
+                    ));
+                }
+            };
+            self.advance()?;
+            Some(resolution)
+        } else {
+            None
+        };
+
         self.eat_if(&Token::Into)?;
 
         let table = self.parse_identifier()?;
@@ -460,6 +533,7 @@ impl<'a> Parser<'a> {
             table,
             columns,
             source,
+            or_conflict,
         })
     }
 

@@ -13,6 +13,9 @@ use crate::pager::Pager;
 use crate::record;
 use crate::types::Value;
 
+/// Rows scanned from a table: (rowid, column_values).
+type ScannedRows = Vec<(i64, Vec<Value>)>;
+
 /// A group is a key (group-by values) and its matching rows.
 type GroupEntry<'a> = (Vec<Value>, Vec<&'a (i64, Vec<Value>)>);
 
@@ -50,19 +53,26 @@ pub struct TableSchema {
     pub rowid_column: Option<usize>,
     /// Per-column constraints (parallel to `columns`).
     pub column_constraints: Vec<ColumnConstraints>,
+    /// CHECK constraint expressions to evaluate on INSERT/UPDATE.
+    pub check_constraints: Vec<crate::ast::Expr>,
     /// Indexes on this table (name + leading column names), for EXPLAIN QUERY PLAN.
     pub indexes: Vec<TableIndexInfo>,
 }
 
-/// Lightweight index info attached to a TableSchema, used by EXPLAIN QUERY PLAN.
+/// Lightweight index info attached to a TableSchema, used by EXPLAIN QUERY PLAN
+/// and index-based query execution.
 #[derive(Debug, Clone)]
 pub struct TableIndexInfo {
     pub name: String,
     pub columns: Vec<String>,
+    /// Root page of the index B-tree.
+    pub root_page: u32,
+    /// Whether this is a UNIQUE index.
+    pub unique: bool,
 }
 
 /// Result of executing a query.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct QueryResult {
     pub columns: Vec<ColumnInfo>,
     pub rows: Vec<Row>,
@@ -94,34 +104,330 @@ fn scan_table(pager: &mut Pager, schema: &TableSchema) -> Result<Vec<(i64, Vec<V
     Ok(rows)
 }
 
+/// Fetch a single row from a table by its rowid.
+fn fetch_row_by_rowid(
+    pager: &mut Pager,
+    schema: &TableSchema,
+    target_rowid: i64,
+) -> Result<Option<(i64, Vec<Value>)>> {
+    let mut cursor = BTreeCursor::new(schema.root_page);
+    if !cursor.seek_rowid(pager, target_rowid)? {
+        return Ok(None);
+    }
+    let payload = cursor.current_payload(pager)?;
+    let mut values = record::decode_record(&payload)?;
+    if let Some(pk_idx) = schema.rowid_column {
+        if pk_idx < values.len() {
+            values[pk_idx] = Value::Integer(target_rowid);
+        } else if values.len() < schema.columns.len() {
+            values.insert(pk_idx, Value::Integer(target_rowid));
+        }
+    }
+    Ok(Some((target_rowid, values)))
+}
+
+/// Try to find a usable index for the WHERE clause and scan using it.
+/// Returns None if no index is usable, otherwise returns the matching rows.
+fn try_index_scan(
+    pager: &mut Pager,
+    schema: &TableSchema,
+    where_expr: &Expr,
+) -> Option<Result<ScannedRows>> {
+    // Extract simple equality conditions: col = value or value = col.
+    let eq_conditions = extract_eq_conditions(where_expr);
+    if eq_conditions.is_empty() {
+        return None;
+    }
+
+    // Find the best matching index (most leading columns matched).
+    let mut best_index: Option<&TableIndexInfo> = None;
+    let mut best_match_count = 0;
+
+    for idx in &schema.indexes {
+        // Count how many leading index columns have equality conditions.
+        let mut matched = 0;
+        for idx_col in &idx.columns {
+            if eq_conditions
+                .iter()
+                .any(|(col, _)| col.eq_ignore_ascii_case(idx_col))
+            {
+                matched += 1;
+            } else {
+                break; // Must be leading columns.
+            }
+        }
+        if matched > best_match_count {
+            best_match_count = matched;
+            best_index = Some(idx);
+        }
+    }
+
+    let index = best_index?;
+    let num_index_cols = index.columns.len();
+    let index_root = index.root_page;
+
+    // Gather the target values for the matched leading columns.
+    let mut target_values: Vec<Option<Value>> = Vec::with_capacity(num_index_cols);
+    for idx_col in &index.columns {
+        let val = eq_conditions
+            .iter()
+            .find(|(col, _)| col.eq_ignore_ascii_case(idx_col))
+            .map(|(_, v)| v.clone());
+        target_values.push(val);
+    }
+
+    // Scan the index and collect matching table rowids.
+    Some((|| {
+        let mut rows = Vec::new();
+        let mut cursor = BTreeCursor::new(index_root);
+        cursor.move_to_first(pager)?;
+
+        while cursor.is_valid() {
+            let payload = cursor.current_payload(pager)?;
+            let index_values = record::decode_record(&payload)?;
+
+            // Check if the leading columns match our target values.
+            let mut matches = true;
+            for (i, target) in target_values.iter().enumerate() {
+                if let Some(ref target_val) = target {
+                    let idx_val = index_values.get(i).unwrap_or(&Value::Null);
+                    // Use sqlite_cmp but skip NULL = NULL (NULL never matches in equality).
+                    if matches!(idx_val, Value::Null)
+                        || matches!(target_val, Value::Null)
+                        || crate::types::sqlite_cmp(idx_val, target_val)
+                            != std::cmp::Ordering::Equal
+                    {
+                        matches = false;
+                        break;
+                    }
+                }
+            }
+
+            if matches {
+                // The last value in the index record is the table rowid.
+                if let Some(Value::Integer(table_rowid)) = index_values.get(num_index_cols) {
+                    if let Some(row) = fetch_row_by_rowid(pager, schema, *table_rowid)? {
+                        rows.push(row);
+                    }
+                }
+            }
+
+            cursor.move_to_next(pager)?;
+        }
+
+        Ok(rows)
+    })())
+}
+
+/// Extract simple `column = literal` conditions from a WHERE expression.
+/// Returns pairs of (column_name, value).
+fn extract_eq_conditions(expr: &Expr) -> Vec<(String, Value)> {
+    let mut conditions = Vec::new();
+    collect_eq_conditions(expr, &mut conditions);
+    conditions
+}
+
+fn collect_eq_conditions(expr: &Expr, out: &mut Vec<(String, Value)>) {
+    match expr {
+        Expr::BinaryOp { left, op, right } if *op == BinaryOp::Eq => {
+            // col = literal
+            if let (Expr::ColumnRef { column, .. }, Some(val)) =
+                (left.as_ref(), expr_to_value(right))
+            {
+                out.push((column.clone(), val));
+            }
+            // literal = col
+            else if let (Expr::ColumnRef { column, .. }, Some(val)) =
+                (right.as_ref(), expr_to_value(left))
+            {
+                out.push((column.clone(), val));
+            }
+        }
+        Expr::BinaryOp { left, op, right } if *op == BinaryOp::And => {
+            collect_eq_conditions(left, out);
+            collect_eq_conditions(right, out);
+        }
+        _ => {}
+    }
+}
+
+/// Try to evaluate a simple expression to a constant Value.
+fn expr_to_value(expr: &Expr) -> Option<Value> {
+    match expr {
+        Expr::Literal(LiteralValue::Integer(i)) => Some(Value::Integer(*i)),
+        Expr::Literal(LiteralValue::Real(r)) => Some(Value::Real(*r)),
+        Expr::Literal(LiteralValue::String(s)) => Some(Value::Text(s.clone())),
+        Expr::Literal(LiteralValue::Null) => Some(Value::Null),
+        Expr::Literal(LiteralValue::Blob(b)) => Some(Value::Blob(b.clone())),
+        // Handle negative numbers: UnaryOp { op: Minus, operand: Literal(Integer) }
+        Expr::UnaryOp {
+            op: UnaryOp::Negate,
+            operand,
+        } => match operand.as_ref() {
+            Expr::Literal(LiteralValue::Integer(i)) => Some(Value::Integer(-i)),
+            Expr::Literal(LiteralValue::Real(r)) => Some(Value::Real(-r)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Execute a SELECT statement against the database.
 pub fn execute_select(
     pager: &mut Pager,
     stmt: &SelectStatement,
     tables: &[TableSchema],
 ) -> Result<QueryResult> {
+    let cte_results: std::collections::HashMap<String, QueryResult> =
+        std::collections::HashMap::new();
+    execute_select_with_ctes(pager, stmt, tables, cte_results)
+}
+
+/// Execute a recursive CTE using iterative fixed-point evaluation.
+fn execute_recursive_cte(
+    pager: &mut Pager,
+    cte: &crate::ast::Cte,
+    tables: &[TableSchema],
+    existing_ctes: &std::collections::HashMap<String, QueryResult>,
+) -> Result<QueryResult> {
+    let select = &cte.query;
+
+    // The recursive CTE must have a compound clause (UNION or UNION ALL).
+    if select.compound.is_empty() {
+        return execute_select(pager, select, tables);
+    }
+
+    let is_union_all = select.compound[0].op == crate::ast::CompoundOp::UnionAll;
+
+    // Execute the base case (the initial SELECT before the UNION).
+    let mut base_stmt = select.clone();
+    base_stmt.compound.clear();
+    let base_result = execute_select(pager, &base_stmt, tables)?;
+
+    let col_infos: Vec<ColumnInfo> = if let Some(ref names) = cte.columns {
+        names
+            .iter()
+            .map(|n| ColumnInfo {
+                name: n.clone(),
+                table: None,
+            })
+            .collect()
+    } else {
+        base_result.columns.clone()
+    };
+
+    let mut all_rows: Vec<Row> = base_result.rows;
+    let mut working_set: Vec<Row> = all_rows.clone();
+
+    let max_iterations = 1000;
+    for _ in 0..max_iterations {
+        if working_set.is_empty() {
+            break;
+        }
+
+        // Make the working set available as the CTE name.
+        let mut temp_ctes = existing_ctes.clone();
+        temp_ctes.insert(
+            cte.name.to_lowercase(),
+            QueryResult {
+                columns: col_infos.clone(),
+                rows: working_set,
+            },
+        );
+
+        // Execute the recursive step.
+        let recursive_stmt = &select.compound[0].select;
+        let new_result = execute_select_with_ctes(pager, recursive_stmt, tables, temp_ctes)?;
+
+        working_set = new_result.rows;
+
+        if !is_union_all {
+            // UNION: deduplicate against all_rows.
+            working_set.retain(|row| {
+                !all_rows
+                    .iter()
+                    .any(|existing| existing.values == row.values)
+            });
+        }
+
+        all_rows.extend(working_set.clone());
+    }
+
+    Ok(QueryResult {
+        columns: col_infos,
+        rows: all_rows,
+    })
+}
+
+/// Inner execute_select that accepts pre-materialized CTE results.
+fn execute_select_with_ctes(
+    pager: &mut Pager,
+    stmt: &SelectStatement,
+    tables: &[TableSchema],
+    mut cte_results: std::collections::HashMap<String, QueryResult>,
+) -> Result<QueryResult> {
+    // Materialize CTEs from the statement itself.
+    for cte in &stmt.ctes {
+        if cte.recursive {
+            let result = execute_recursive_cte(pager, cte, tables, &cte_results)?;
+            cte_results.insert(cte.name.to_lowercase(), result);
+        } else {
+            let result = execute_select_with_ctes(pager, &cte.query, tables, cte_results.clone())?;
+            let result = if let Some(ref col_names) = cte.columns {
+                let mut renamed = result;
+                for (i, name) in col_names.iter().enumerate() {
+                    if i < renamed.columns.len() {
+                        renamed.columns[i] = ColumnInfo {
+                            name: name.clone(),
+                            table: None,
+                        };
+                    }
+                }
+                renamed
+            } else {
+                result
+            };
+            cte_results.insert(cte.name.to_lowercase(), result);
+        }
+    }
+
     // Determine the source table(s).
+    let subquery_result: Option<QueryResult>;
     let (table_schema, table_alias, original_table_name) = match &stmt.from {
         Some(from) => {
-            let (table_name, alias) = match &from.table {
+            match &from.table {
                 crate::ast::TableRef::Table { name, alias } => {
-                    (name.as_str(), alias.as_deref().unwrap_or(name.as_str()))
+                    let table_name = name.as_str();
+                    let alias_str = alias.as_deref().unwrap_or(table_name);
+                    // Check CTEs first.
+                    if let Some(cte_result) = cte_results.remove(&table_name.to_lowercase()) {
+                        subquery_result = Some(cte_result);
+                        (None, alias_str.to_string(), None)
+                    } else {
+                        let schema = tables
+                            .iter()
+                            .find(|t| t.name.eq_ignore_ascii_case(table_name))
+                            .ok_or_else(|| {
+                                RsqliteError::Runtime(format!("no such table: {table_name}"))
+                            })?;
+                        subquery_result = None;
+                        (
+                            Some(schema),
+                            alias_str.to_string(),
+                            Some(table_name.to_string()),
+                        )
+                    }
                 }
-                crate::ast::TableRef::Subquery { .. } => {
-                    return Err(RsqliteError::NotImplemented("subqueries in FROM".into()));
+                crate::ast::TableRef::Subquery { select, alias } => {
+                    subquery_result = Some(execute_select(pager, select, tables)?);
+                    (None, alias.clone(), None)
                 }
-            };
-            let schema = tables
-                .iter()
-                .find(|t| t.name.eq_ignore_ascii_case(table_name))
-                .ok_or_else(|| RsqliteError::Runtime(format!("no such table: {table_name}")))?;
-            (
-                Some(schema),
-                alias.to_string(),
-                Some(table_name.to_string()),
-            )
+            }
         }
-        None => (None, String::new(), None),
+        None => {
+            subquery_result = None;
+            (None, String::new(), None)
+        }
     };
 
     // Build the combined column names and rows, handling JOINs.
@@ -270,11 +576,35 @@ pub fn execute_select(
 
         let col_names: Vec<String> = combined_columns;
         (col_names, combined_rows, None)
+    } else if let Some(sub_result) = subquery_result {
+        // FROM subquery: use the subquery result as source rows.
+        let col_names: Vec<String> = sub_result.columns.iter().map(|c| c.name.clone()).collect();
+        let raw_rows: Vec<(i64, Vec<Value>)> = sub_result
+            .rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, row)| (i as i64 + 1, row.values))
+            .collect();
+        let tname: Option<&str> = if !table_alias.is_empty() {
+            Some(table_alias.as_str())
+        } else {
+            None
+        };
+        (col_names, raw_rows, tname)
     } else {
-        // No JOINs - single table scan.
+        // No JOINs - try index scan, fall back to full table scan.
         let mut raw_rows: Vec<(i64, Vec<Value>)> = Vec::new();
         if let Some(schema) = table_schema {
-            raw_rows = scan_table(pager, schema)?;
+            // Try an index scan if there's a WHERE clause with usable conditions.
+            let used_index = if let Some(ref where_expr) = stmt.where_clause {
+                try_index_scan(pager, schema, where_expr)
+            } else {
+                None
+            };
+            raw_rows = match used_index {
+                Some(result) => result?,
+                None => scan_table(pager, schema)?,
+            };
         } else {
             // No FROM clause: produce a single synthetic row for expression evaluation.
             raw_rows.push((0, vec![]));

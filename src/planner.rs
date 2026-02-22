@@ -8,7 +8,7 @@
 //
 // Column names are extracted from CREATE TABLE SQL in the schema entries.
 
-use crate::ast::{Expr, FunctionArgs, InsertSource, LiteralValue, Statement};
+use crate::ast::{BinaryOp, Expr, FunctionArgs, InsertSource, LiteralValue, Statement};
 use crate::btree;
 use crate::error::{Result, RsqliteError};
 use crate::pager::Pager;
@@ -314,6 +314,112 @@ impl Database {
                 }
             }
 
+            // Enforce CHECK constraints.
+            if !schema.check_constraints.is_empty() {
+                // Build the full row with IPK restored for expression evaluation.
+                let mut check_values = values.clone();
+                if let Some(pk_idx) = schema.rowid_column {
+                    check_values[pk_idx] = Value::Integer(rowid);
+                }
+                let col_names: Vec<&str> = schema.columns.iter().map(|s| s.as_str()).collect();
+                for check_expr in &schema.check_constraints {
+                    let result = vm::eval_expr(
+                        check_expr,
+                        &col_names,
+                        &check_values,
+                        rowid,
+                        Some(&schema.name),
+                    )?;
+                    if let Value::Integer(0) = result {
+                        return Err(RsqliteError::Constraint(
+                            "CHECK constraint failed".to_string(),
+                        ));
+                    }
+                }
+            }
+
+            // Handle conflict resolution for UNIQUE/PK violations.
+            let conflict = insert.or_conflict;
+
+            // Check for rowid (PRIMARY KEY) conflict.
+            {
+                let mut cursor = btree::BTreeCursor::new(root_page);
+                if cursor.seek_rowid(&mut self.pager, rowid)? {
+                    // Rowid already exists — conflict!
+                    match conflict {
+                        Some(crate::ast::ConflictResolution::Replace) => {
+                            // Delete old index entries and the old row.
+                            if !indexes.is_empty() {
+                                delete_from_indexes(&mut self.pager, &indexes, rowid)?;
+                            }
+                            btree::btree_delete(&mut self.pager, root_page, rowid)?;
+                        }
+                        Some(crate::ast::ConflictResolution::Ignore) => {
+                            continue; // Skip this row.
+                        }
+                        _ => {
+                            // Abort (default) / Fail / Rollback — error out.
+                            return Err(RsqliteError::Constraint(format!(
+                                "UNIQUE constraint failed: {}.rowid",
+                                schema.name
+                            )));
+                        }
+                    }
+                }
+            }
+
+            // Check for UNIQUE index conflicts.
+            if !indexes.is_empty() {
+                let mut full_check_values = values.clone();
+                if let Some(pk_idx) = schema.rowid_column {
+                    if pk_idx < full_check_values.len() {
+                        full_check_values[pk_idx] = Value::Integer(rowid);
+                    }
+                }
+
+                let mut skip_row = false;
+                for index in &indexes {
+                    if !index.unique {
+                        continue;
+                    }
+                    let key_values: Vec<Value> = index
+                        .column_indices
+                        .iter()
+                        .map(|&i| full_check_values.get(i).cloned().unwrap_or(Value::Null))
+                        .collect();
+
+                    // NULLs don't conflict.
+                    if key_values.iter().any(|v| matches!(v, Value::Null)) {
+                        continue;
+                    }
+
+                    if let Some(conflicting_rowid) =
+                        find_unique_conflict(&mut self.pager, index, &key_values)?
+                    {
+                        match conflict {
+                            Some(crate::ast::ConflictResolution::Replace) => {
+                                // Delete the conflicting row and its index entries.
+                                delete_from_indexes(&mut self.pager, &indexes, conflicting_rowid)?;
+                                btree::btree_delete(&mut self.pager, root_page, conflicting_rowid)?;
+                            }
+                            Some(crate::ast::ConflictResolution::Ignore) => {
+                                skip_row = true;
+                                break;
+                            }
+                            _ => {
+                                return Err(RsqliteError::Constraint(format!(
+                                    "UNIQUE constraint failed: {}",
+                                    index.name
+                                )));
+                            }
+                        }
+                    }
+                }
+                if skip_row {
+                    continue;
+                }
+            }
+
             let payload = record::encode_record(&values);
             let new_root = btree::btree_insert(&mut self.pager, root_page, rowid, &payload)?;
 
@@ -323,7 +429,7 @@ impl Database {
                 root_page = new_root;
             }
 
-            // Maintain indexes: build the full row values (with IPK restored) for index insertion.
+            // Maintain indexes: insert new entries (no UNIQUE check needed — conflicts already handled).
             if !indexes.is_empty() {
                 let mut full_values = values;
                 if let Some(pk_idx) = schema.rowid_column {
@@ -331,7 +437,12 @@ impl Database {
                         full_values[pk_idx] = Value::Integer(rowid);
                     }
                 }
-                insert_into_indexes(&mut self.pager, &mut indexes, &full_values, rowid)?;
+                insert_into_indexes_no_unique_check(
+                    &mut self.pager,
+                    &mut indexes,
+                    &full_values,
+                    rowid,
+                )?;
             }
 
             changes += 1;
@@ -482,6 +593,28 @@ impl Database {
                         }
                     }
                 }
+                // Enforce CHECK constraints on updated values.
+                if !schema.check_constraints.is_empty() {
+                    let mut check_values = values.clone();
+                    if let Some(pk_idx) = schema.rowid_column {
+                        check_values[pk_idx] = Value::Integer(rowid);
+                    }
+                    let col_names: Vec<&str> = schema.columns.iter().map(|s| s.as_str()).collect();
+                    for check_expr in &schema.check_constraints {
+                        let result = vm::eval_expr(
+                            check_expr,
+                            &col_names,
+                            &check_values,
+                            rowid,
+                            Some(&schema.name),
+                        )?;
+                        if let Value::Integer(0) = result {
+                            return Err(RsqliteError::Constraint(
+                                "CHECK constraint failed".to_string(),
+                            ));
+                        }
+                    }
+                }
                 updates.push((rowid, values));
             }
             cursor.move_to_next(&mut self.pager)?;
@@ -540,7 +673,8 @@ impl Database {
     fn execute_drop_table(&mut self, drop: &crate::ast::DropTableStatement) -> Result<QueryResult> {
         let schema_entries = schema::read_schema(&mut self.pager)?;
 
-        if schema::find_table(&schema_entries, &drop.name).is_none() {
+        let table_entry = schema::find_table(&schema_entries, &drop.name);
+        if table_entry.is_none() {
             if drop.if_exists {
                 return Ok(empty_result());
             }
@@ -549,29 +683,54 @@ impl Database {
                 drop.name
             )));
         }
+        let table_root = table_entry.unwrap().rootpage as u32;
 
-        // Find and delete the sqlite_master entry.
+        // Collect pages to free: table B-tree + all associated index B-trees.
+        let mut pages_to_free: Vec<u32> = btree::collect_btree_pages(&mut self.pager, table_root)?;
+
+        // Find and collect index pages, then delete index schema entries.
+        let mut schema_rowids_to_delete = Vec::new();
         let mut cursor = btree::BTreeCursor::new(1);
         cursor.move_to_first(&mut self.pager)?;
 
-        let mut rowid_to_delete = None;
         while cursor.is_valid() {
             let rowid = cursor.current_rowid(&mut self.pager)?;
             let payload = cursor.current_payload(&mut self.pager)?;
             let values = record::decode_record(&payload)?;
-            if values.len() >= 2 {
-                if let Value::Text(ref name) = values[1] {
-                    if name.eq_ignore_ascii_case(&drop.name) {
-                        rowid_to_delete = Some(rowid);
-                        break;
+            if values.len() >= 3 {
+                if let (Value::Text(ref entry_type), Value::Text(ref name)) =
+                    (&values[0], &values[1])
+                {
+                    let tbl_name = if let Value::Text(ref t) = values[2] {
+                        t.as_str()
+                    } else {
+                        ""
+                    };
+                    if name.eq_ignore_ascii_case(&drop.name)
+                        || (entry_type == "index" && tbl_name.eq_ignore_ascii_case(&drop.name))
+                    {
+                        schema_rowids_to_delete.push(rowid);
+                        if entry_type == "index" {
+                            if let Value::Integer(rp) = &values[3] {
+                                let idx_pages =
+                                    btree::collect_btree_pages(&mut self.pager, *rp as u32)?;
+                                pages_to_free.extend(idx_pages);
+                            }
+                        }
                     }
                 }
             }
             cursor.move_to_next(&mut self.pager)?;
         }
 
-        if let Some(rowid) = rowid_to_delete {
+        // Delete schema entries.
+        for rowid in schema_rowids_to_delete {
             btree::btree_delete(&mut self.pager, 1, rowid)?;
+        }
+
+        // Free all collected pages.
+        for page_num in pages_to_free {
+            self.pager.free_page(page_num)?;
         }
 
         self.pager.header.schema_cookie += 1;
@@ -709,11 +868,11 @@ impl Database {
     fn execute_drop_index(&mut self, drop: &crate::ast::DropIndexStatement) -> Result<QueryResult> {
         let schema_entries = schema::read_schema(&mut self.pager)?;
 
-        let found = schema_entries
+        let idx_entry = schema_entries
             .iter()
-            .any(|e| e.entry_type == "index" && e.name.eq_ignore_ascii_case(&drop.name));
+            .find(|e| e.entry_type == "index" && e.name.eq_ignore_ascii_case(&drop.name));
 
-        if !found {
+        if idx_entry.is_none() {
             if drop.if_exists {
                 return Ok(empty_result());
             }
@@ -722,6 +881,10 @@ impl Database {
                 drop.name
             )));
         }
+        let index_root = idx_entry.unwrap().rootpage as u32;
+
+        // Collect all pages of the index B-tree.
+        let pages_to_free = btree::collect_btree_pages(&mut self.pager, index_root)?;
 
         // Find and delete the sqlite_master entry.
         let mut cursor = btree::BTreeCursor::new(1);
@@ -747,6 +910,11 @@ impl Database {
 
         if let Some(rowid) = rowid_to_delete {
             btree::btree_delete(&mut self.pager, 1, rowid)?;
+        }
+
+        // Free the index pages.
+        for page_num in pages_to_free {
+            self.pager.free_page(page_num)?;
         }
 
         self.pager.header.schema_cookie += 1;
@@ -1002,6 +1170,7 @@ fn build_table_schemas(entries: &[SchemaEntry]) -> Result<Vec<TableSchema>> {
                 columns: vec![],
                 rowid_column: None,
                 constraints: vec![],
+                check_constraints: Vec::new(),
             }
         };
 
@@ -1018,6 +1187,8 @@ fn build_table_schemas(entries: &[SchemaEntry]) -> Result<Vec<TableSchema>> {
                     indexes.push(vm::TableIndexInfo {
                         name: idx_entry.name.clone(),
                         columns: ci.columns.iter().map(|c| c.name.clone()).collect(),
+                        root_page: idx_entry.rootpage as u32,
+                        unique: ci.unique,
                     });
                 }
             }
@@ -1029,6 +1200,7 @@ fn build_table_schemas(entries: &[SchemaEntry]) -> Result<Vec<TableSchema>> {
             root_page: entry.rootpage as u32,
             rowid_column: info.rowid_column,
             column_constraints: info.constraints,
+            check_constraints: info.check_constraints,
             indexes,
         });
     }
@@ -1097,8 +1269,43 @@ fn build_index_schemas(
     indexes
 }
 
-/// Insert a row into all indexes for a table.
+/// Insert a row into all indexes for a table, enforcing UNIQUE constraints.
 fn insert_into_indexes(
+    pager: &mut Pager,
+    indexes: &mut [IndexSchema],
+    row_values: &[Value],
+    table_rowid: i64,
+) -> Result<()> {
+    for index in indexes.iter_mut() {
+        let key_values: Vec<Value> = index
+            .column_indices
+            .iter()
+            .map(|&i| row_values.get(i).cloned().unwrap_or(Value::Null))
+            .collect();
+
+        // Enforce UNIQUE constraint: check for existing entries with the same key.
+        // Per SQL standard, multiple NULLs are allowed in UNIQUE columns.
+        if index.unique && !key_values.iter().any(|v| matches!(v, Value::Null)) {
+            check_unique_violation(pager, index, &key_values)?;
+        }
+
+        let mut index_values = key_values;
+        index_values.push(Value::Integer(table_rowid));
+
+        let index_payload = record::encode_record(&index_values);
+        let idx_rowid = btree::find_max_rowid(pager, index.root_page)? + 1;
+        let new_root = btree::btree_insert(pager, index.root_page, idx_rowid, &index_payload)?;
+        if new_root != index.root_page {
+            update_root_page(pager, &index.name, new_root)?;
+            index.root_page = new_root;
+        }
+    }
+    Ok(())
+}
+
+/// Insert a row into all indexes without checking UNIQUE constraints.
+/// Used when conflicts have already been resolved (e.g., INSERT OR REPLACE).
+fn insert_into_indexes_no_unique_check(
     pager: &mut Pager,
     indexes: &mut [IndexSchema],
     row_values: &[Value],
@@ -1120,6 +1327,60 @@ fn insert_into_indexes(
             index.root_page = new_root;
         }
     }
+    Ok(())
+}
+
+/// Find the table rowid that conflicts with the given key values in a UNIQUE index.
+/// Returns Some(rowid) if a conflict exists, None otherwise.
+fn find_unique_conflict(
+    pager: &mut Pager,
+    index: &IndexSchema,
+    key_values: &[Value],
+) -> Result<Option<i64>> {
+    let num_cols = index.column_indices.len();
+    let mut cursor = btree::BTreeCursor::new(index.root_page);
+    cursor.move_to_first(pager)?;
+
+    while cursor.is_valid() {
+        let payload = cursor.current_payload(pager)?;
+        let existing = record::decode_record(&payload)?;
+
+        let all_equal = key_values
+            .iter()
+            .take(num_cols)
+            .enumerate()
+            .all(|(i, new_val)| {
+                let existing_val = existing.get(i).unwrap_or(&Value::Null);
+                !matches!(existing_val, Value::Null)
+                    && crate::types::sqlite_cmp(existing_val, new_val) == std::cmp::Ordering::Equal
+            });
+
+        if all_equal {
+            // The last value in the index record is the table rowid.
+            if let Some(Value::Integer(table_rowid)) = existing.get(num_cols) {
+                return Ok(Some(*table_rowid));
+            }
+        }
+
+        cursor.move_to_next(pager)?;
+    }
+
+    Ok(None)
+}
+
+/// Check if inserting `key_values` would violate a UNIQUE index constraint.
+fn check_unique_violation(
+    pager: &mut Pager,
+    index: &IndexSchema,
+    key_values: &[Value],
+) -> Result<()> {
+    if find_unique_conflict(pager, index, key_values)?.is_some() {
+        return Err(RsqliteError::Constraint(format!(
+            "UNIQUE constraint failed: {}",
+            index.name
+        )));
+    }
+
     Ok(())
 }
 
@@ -1155,6 +1416,7 @@ struct FullTableInfo {
     columns: Vec<String>,
     rowid_column: Option<usize>,
     constraints: Vec<vm::ColumnConstraints>,
+    check_constraints: Vec<crate::ast::Expr>,
 }
 
 /// Extract column names, INTEGER PRIMARY KEY index, and constraints from a CREATE TABLE SQL.
@@ -1164,10 +1426,12 @@ fn extract_table_info(sql: &str) -> FullTableInfo {
         let columns: Vec<String> = ct.columns.iter().map(|c| c.name.clone()).collect();
         let rowid_col = find_integer_primary_key(&ct);
         let constraints = extract_constraints(&ct, rowid_col);
+        let check_constraints = extract_check_constraints(&ct);
         return FullTableInfo {
             columns,
             rowid_column: rowid_col,
             constraints,
+            check_constraints,
         };
     }
 
@@ -1179,6 +1443,7 @@ fn extract_table_info(sql: &str) -> FullTableInfo {
         columns,
         rowid_column: rowid_col,
         constraints,
+        check_constraints: Vec::new(),
     }
 }
 
@@ -1215,6 +1480,26 @@ fn extract_constraints(
             cc
         })
         .collect()
+}
+
+/// Extract CHECK constraint expressions from both column-level and table-level constraints.
+fn extract_check_constraints(ct: &crate::ast::CreateTableStatement) -> Vec<crate::ast::Expr> {
+    let mut checks = Vec::new();
+    // Column-level CHECK constraints.
+    for col in &ct.columns {
+        for constraint in &col.constraints {
+            if let crate::ast::ColumnConstraint::Check(expr) = constraint {
+                checks.push(expr.clone());
+            }
+        }
+    }
+    // Table-level CHECK constraints.
+    for constraint in &ct.constraints {
+        if let crate::ast::TableConstraint::Check(expr) = constraint {
+            checks.push(expr.clone());
+        }
+    }
+    checks
 }
 
 /// Find the INTEGER PRIMARY KEY column from a parsed CREATE TABLE statement.
@@ -1426,6 +1711,11 @@ fn reconstruct_create_table_sql(ct: &crate::ast::CreateTableStatement) -> String
                     sql.push_str(" DEFAULT ");
                     sql.push_str(&expr_to_sql(expr));
                 }
+                crate::ast::ColumnConstraint::Check(expr) => {
+                    sql.push_str(" CHECK(");
+                    sql.push_str(&expr_to_sql(expr));
+                    sql.push(')');
+                }
                 _ => {}
             }
         }
@@ -1455,6 +1745,11 @@ fn reconstruct_create_table_sql(ct: &crate::ast::CreateTableStatement) -> String
                 }
                 sql.push(')');
             }
+            crate::ast::TableConstraint::Check(expr) => {
+                sql.push_str("CHECK(");
+                sql.push_str(&expr_to_sql(expr));
+                sql.push(')');
+            }
             _ => {}
         }
     }
@@ -1479,10 +1774,44 @@ fn expr_to_sql(expr: &Expr) -> String {
             LiteralValue::CurrentDate => "CURRENT_DATE".to_string(),
             LiteralValue::CurrentTimestamp => "CURRENT_TIMESTAMP".to_string(),
         },
-        Expr::UnaryOp {
-            op: crate::ast::UnaryOp::Negate,
-            operand,
-        } => format!("-{}", expr_to_sql(operand)),
+        Expr::UnaryOp { op, operand } => {
+            let inner = expr_to_sql(operand);
+            match op {
+                crate::ast::UnaryOp::Negate => format!("-{inner}"),
+                crate::ast::UnaryOp::Not => format!("NOT {inner}"),
+                crate::ast::UnaryOp::BitwiseNot => format!("~{inner}"),
+                crate::ast::UnaryOp::Plus => format!("+{inner}"),
+            }
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let l = expr_to_sql(left);
+            let r = expr_to_sql(right);
+            let op_str = match op {
+                BinaryOp::Add => "+",
+                BinaryOp::Subtract => "-",
+                BinaryOp::Multiply => "*",
+                BinaryOp::Divide => "/",
+                BinaryOp::Modulo => "%",
+                BinaryOp::Eq => "=",
+                BinaryOp::NotEq => "!=",
+                BinaryOp::Lt => "<",
+                BinaryOp::Gt => ">",
+                BinaryOp::Le => "<=",
+                BinaryOp::Ge => ">=",
+                BinaryOp::And => "AND",
+                BinaryOp::Or => "OR",
+                BinaryOp::Concat => "||",
+                BinaryOp::BitAnd => "&",
+                BinaryOp::BitOr => "|",
+                BinaryOp::ShiftLeft => "<<",
+                BinaryOp::ShiftRight => ">>",
+                BinaryOp::Is => "IS",
+                BinaryOp::IsNot => "IS NOT",
+                BinaryOp::Glob => "GLOB",
+                BinaryOp::Like => "LIKE",
+            };
+            format!("{l} {op_str} {r}")
+        }
         Expr::Parenthesized(inner) => format!("({})", expr_to_sql(inner)),
         Expr::FunctionCall { name, args } => {
             let args_str = match args {
@@ -1499,6 +1828,49 @@ fn expr_to_sql(expr: &Expr) -> String {
             } else {
                 column.clone()
             }
+        }
+        Expr::IsNull { operand, negated } => {
+            if *negated {
+                format!("{} IS NOT NULL", expr_to_sql(operand))
+            } else {
+                format!("{} IS NULL", expr_to_sql(operand))
+            }
+        }
+        Expr::Between {
+            operand,
+            low,
+            high,
+            negated,
+        } => {
+            let not = if *negated { " NOT" } else { "" };
+            format!(
+                "{}{not} BETWEEN {} AND {}",
+                expr_to_sql(operand),
+                expr_to_sql(low),
+                expr_to_sql(high)
+            )
+        }
+        Expr::In {
+            operand,
+            list,
+            negated,
+        } => {
+            let not = if *negated { " NOT" } else { "" };
+            match list {
+                crate::ast::InList::Values(vals) => {
+                    let vals_str: Vec<String> = vals.iter().map(expr_to_sql).collect();
+                    format!("{}{not} IN ({})", expr_to_sql(operand), vals_str.join(", "))
+                }
+                crate::ast::InList::Subquery(sel) => {
+                    format!("{}{not} IN ({sel:?})", expr_to_sql(operand))
+                }
+            }
+        }
+        Expr::Cast {
+            expr: inner,
+            type_name,
+        } => {
+            format!("CAST({} AS {type_name})", expr_to_sql(inner))
         }
         _ => format!("{expr:?}"), // Fallback for complex expressions
     }
@@ -1562,6 +1934,7 @@ fn execute_pragma(pragma: &crate::ast::PragmaStatement, pager: &mut Pager) -> Re
                     columns: vec![],
                     rowid_column: None,
                     constraints: vec![],
+                    check_constraints: Vec::new(),
                 }
             };
 
@@ -2391,6 +2764,7 @@ mod tests {
             order_by: None,
             limit: None,
             compound: vec![],
+            ctes: vec![],
         };
 
         let result = vm::execute_select(&mut db.pager, &select, &table_schemas).unwrap();
@@ -2483,6 +2857,7 @@ mod tests {
             order_by: None,
             limit: None,
             compound: vec![],
+            ctes: vec![],
         };
 
         let result = vm::execute_select(&mut db.pager, &select, &table_schemas).unwrap();

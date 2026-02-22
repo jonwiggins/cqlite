@@ -46,6 +46,17 @@ pub struct SelectStatement {
     pub limit: Option<LimitClause>,
     /// Compound operations (UNION, UNION ALL, INTERSECT, EXCEPT).
     pub compound: Vec<CompoundClause>,
+    /// Common Table Expressions (WITH clause).
+    pub ctes: Vec<Cte>,
+}
+
+/// A single Common Table Expression definition.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cte {
+    pub name: String,
+    pub columns: Option<Vec<String>>,
+    pub query: Box<SelectStatement>,
+    pub recursive: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -134,6 +145,17 @@ pub struct InsertStatement {
     pub table: String,
     pub columns: Option<Vec<String>>,
     pub source: InsertSource,
+    pub or_conflict: Option<ConflictResolution>,
+}
+
+/// Conflict resolution strategy for INSERT OR ... and ON CONFLICT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictResolution {
+    Abort,
+    Fail,
+    Ignore,
+    Replace,
+    Rollback,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -432,6 +454,7 @@ mod tests {
             order_by: None,
             limit: None,
             compound: vec![],
+            ctes: vec![],
         };
         assert!(!stmt.distinct);
         assert_eq!(stmt.columns.len(), 1);

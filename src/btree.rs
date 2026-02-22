@@ -1449,6 +1449,50 @@ pub fn btree_delete(pager: &mut Pager, root_page: PageNumber, rowid: i64) -> Res
     delete_from_subtree(pager, root_page, rowid)
 }
 
+/// Collect all page numbers in a B-tree rooted at `root_page`.
+/// Returns a list of all page numbers (including interior and leaf pages).
+pub fn collect_btree_pages(pager: &mut Pager, root_page: PageNumber) -> Result<Vec<PageNumber>> {
+    let mut pages = Vec::new();
+    collect_pages_recursive(pager, root_page, &mut pages)?;
+    Ok(pages)
+}
+
+fn collect_pages_recursive(
+    pager: &mut Pager,
+    page_num: PageNumber,
+    pages: &mut Vec<PageNumber>,
+) -> Result<()> {
+    pages.push(page_num);
+
+    let header_offset = pager::btree_header_offset(page_num);
+    let data = pager.get_page(page_num)?.data.clone();
+    let header = BTreePageHeader::parse(&data, header_offset)?;
+
+    match header.page_type {
+        BTreePageType::TableInterior | BTreePageType::IndexInterior => {
+            let pointers = read_cell_pointers(&data, header_offset, &header)?;
+            let usable_size = pager.usable_size();
+
+            for &ptr in &pointers {
+                let (cell, _, _) =
+                    parse_cell_raw(&data, ptr as usize, header.page_type, usable_size)?;
+                if let Some(child_page) = cell.left_child() {
+                    collect_pages_recursive(pager, child_page, pages)?;
+                }
+            }
+            // Interior pages also have a rightmost child pointer.
+            if header.right_child != 0 {
+                collect_pages_recursive(pager, header.right_child, pages)?;
+            }
+        }
+        BTreePageType::TableLeaf | BTreePageType::IndexLeaf => {
+            // Leaf pages have no children.
+        }
+    }
+
+    Ok(())
+}
+
 /// Delete a cell with the given rowid from the subtree rooted at `page_num`.
 fn delete_from_subtree(pager: &mut Pager, page_num: PageNumber, rowid: i64) -> Result<bool> {
     let header_offset = pager::btree_header_offset(page_num);

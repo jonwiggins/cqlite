@@ -2565,6 +2565,7 @@ fn eqp_row(id: i64, parent: i64, notused: i64, detail: &str) -> Row {
 }
 
 #[cfg(test)]
+#[allow(clippy::approx_constant)]
 mod tests {
     use super::*;
 

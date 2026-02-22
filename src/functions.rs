@@ -386,6 +386,7 @@ fn check_args(name: &str, args: &[Value], expected: usize) -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::approx_constant)]
 mod tests {
     use super::*;
 

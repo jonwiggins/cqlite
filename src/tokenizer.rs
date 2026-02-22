@@ -1005,6 +1005,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::approx_constant)]
 mod tests {
     use super::*;
 

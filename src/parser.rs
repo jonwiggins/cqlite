@@ -162,6 +162,70 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select_statement(&mut self) -> Result<SelectStatement> {
+        let mut stmt = self.parse_select_core()?;
+
+        // Parse compound operations (UNION, UNION ALL, INTERSECT, EXCEPT).
+        loop {
+            let op = if self.eat_if(&Token::Union)? {
+                if self.eat_if(&Token::All)? {
+                    Some(crate::ast::CompoundOp::UnionAll)
+                } else {
+                    Some(crate::ast::CompoundOp::Union)
+                }
+            } else if self.eat_if(&Token::Intersect)? {
+                Some(crate::ast::CompoundOp::Intersect)
+            } else if self.eat_if(&Token::Except)? {
+                Some(crate::ast::CompoundOp::Except)
+            } else {
+                None
+            };
+
+            if let Some(op) = op {
+                let rhs = self.parse_select_core()?;
+                stmt.compound
+                    .push(crate::ast::CompoundClause { op, select: rhs });
+            } else {
+                break;
+            }
+        }
+
+        // Parse ORDER BY (applies to entire compound result).
+        if self.eat_if(&Token::Order)? {
+            self.expect(&Token::By)?;
+            let mut items = vec![self.parse_order_by_item()?];
+            while self.eat_if(&Token::Comma)? {
+                items.push(self.parse_order_by_item()?);
+            }
+            stmt.order_by = Some(items);
+        }
+
+        // Parse LIMIT (applies to entire compound result).
+        if self.eat_if(&Token::Limit)? {
+            let limit_expr = self.parse_expr()?;
+            let offset = if self.eat_if(&Token::Offset)? {
+                Some(self.parse_expr()?)
+            } else if self.eat_if(&Token::Comma)? {
+                // LIMIT x, y means LIMIT y OFFSET x in SQLite.
+                let real_limit = self.parse_expr()?;
+                stmt.limit = Some(LimitClause {
+                    limit: real_limit,
+                    offset: Some(limit_expr),
+                });
+                return Ok(stmt);
+            } else {
+                None
+            };
+            stmt.limit = Some(LimitClause {
+                limit: limit_expr,
+                offset,
+            });
+        }
+
+        Ok(stmt)
+    }
+
+    /// Parse a single SELECT core (no ORDER BY, LIMIT, or compound ops).
+    fn parse_select_core(&mut self) -> Result<SelectStatement> {
         self.expect(&Token::Select)?;
 
         let distinct = self.eat_if(&Token::Distinct)?;
@@ -197,76 +261,6 @@ impl<'a> Parser<'a> {
             None
         };
 
-        let order_by = if self.eat_if(&Token::Order)? {
-            self.expect(&Token::By)?;
-            let mut items = vec![self.parse_order_by_item()?];
-            while self.eat_if(&Token::Comma)? {
-                items.push(self.parse_order_by_item()?);
-            }
-            Some(items)
-        } else {
-            None
-        };
-
-        let limit = if self.eat_if(&Token::Limit)? {
-            let limit_expr = self.parse_expr()?;
-            let offset = if self.eat_if(&Token::Offset)? {
-                Some(self.parse_expr()?)
-            } else if self.eat_if(&Token::Comma)? {
-                // LIMIT x, y means LIMIT y OFFSET x in SQLite.
-                let real_limit = self.parse_expr()?;
-                let offset = limit_expr;
-                return Ok(SelectStatement {
-                    distinct,
-                    columns,
-                    from,
-                    where_clause,
-                    group_by,
-                    having,
-                    order_by,
-                    limit: Some(LimitClause {
-                        limit: real_limit,
-                        offset: Some(offset),
-                    }),
-                    compound: vec![],
-                    ctes: vec![],
-                });
-            } else {
-                None
-            };
-            Some(LimitClause {
-                limit: limit_expr,
-                offset,
-            })
-        } else {
-            None
-        };
-
-        // Parse compound operations (UNION, UNION ALL, INTERSECT, EXCEPT).
-        let mut compound = Vec::new();
-        loop {
-            let op = if self.eat_if(&Token::Union)? {
-                if self.eat_if(&Token::All)? {
-                    Some(crate::ast::CompoundOp::UnionAll)
-                } else {
-                    Some(crate::ast::CompoundOp::Union)
-                }
-            } else if self.eat_if(&Token::Intersect)? {
-                Some(crate::ast::CompoundOp::Intersect)
-            } else if self.eat_if(&Token::Except)? {
-                Some(crate::ast::CompoundOp::Except)
-            } else {
-                None
-            };
-
-            if let Some(op) = op {
-                let rhs = self.parse_select_statement()?;
-                compound.push(crate::ast::CompoundClause { op, select: rhs });
-            } else {
-                break;
-            }
-        }
-
         Ok(SelectStatement {
             distinct,
             columns,
@@ -274,9 +268,9 @@ impl<'a> Parser<'a> {
             where_clause,
             group_by,
             having,
-            order_by,
-            limit,
-            compound,
+            order_by: None,
+            limit: None,
+            compound: vec![],
             ctes: vec![],
         })
     }

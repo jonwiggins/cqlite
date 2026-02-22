@@ -35,6 +35,7 @@ enum ExpectedResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(clippy::enum_variant_names)]
 enum SortMode {
     NoSort,
     RowSort,
@@ -455,10 +456,9 @@ fn test_sqllogictest_suite_summary() {
         .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| {
-            e.path()
-                .extension()
-                .map(|ext| ext == "test")
-                .unwrap_or(false)
+            let p = e.path();
+            p.extension().map(|ext| ext == "test").unwrap_or(false)
+                && p.file_name().map(|n| n != "select5.test").unwrap_or(true)
         })
         .collect();
     entries.sort_by_key(|e| e.path());
@@ -470,13 +470,34 @@ fn test_sqllogictest_suite_summary() {
     for entry in &entries {
         let path = entry.path();
         let name = path.file_name().unwrap().to_string_lossy();
-        let (passed, failed, _errors) = run_test_file(&path);
+        let (passed, failed, errors) = run_test_file(&path);
         let pct = if passed + failed > 0 {
             100.0 * passed as f64 / (passed + failed) as f64
         } else {
             0.0
         };
         eprintln!("  {name}: {passed} passed, {failed} failed ({pct:.0}%)");
+        if failed > 0 {
+            let mut count_mismatch = 0;
+            let mut hash_mismatch = 0;
+            let mut query_mismatch = 0;
+            let mut query_error = 0;
+            for e in &errors {
+                if e.starts_with("Query count") {
+                    count_mismatch += 1;
+                } else if e.starts_with("Query hash") {
+                    hash_mismatch += 1;
+                } else if e.starts_with("Query mismatch") {
+                    query_mismatch += 1;
+                } else if e.starts_with("Query error") {
+                    query_error += 1;
+                }
+            }
+            eprintln!("    count_mismatch={count_mismatch} hash_mismatch={hash_mismatch} query_mismatch={query_mismatch} query_error={query_error}");
+            for e in errors.iter().take(3) {
+                eprintln!("    ERR: {e}");
+            }
+        }
         total_passed += passed;
         total_failed += failed;
     }

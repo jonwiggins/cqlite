@@ -255,6 +255,7 @@ fn encode_integer(i: i64) -> (u64, Vec<u8>) {
 }
 
 #[cfg(test)]
+#[allow(clippy::approx_constant)]
 mod tests {
     use super::*;
 

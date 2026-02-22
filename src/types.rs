@@ -244,6 +244,7 @@ pub fn apply_affinity(value: Value, affinity: TypeAffinity) -> Value {
 }
 
 #[cfg(test)]
+#[allow(clippy::approx_constant)]
 mod tests {
     use super::*;
 

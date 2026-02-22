@@ -437,6 +437,14 @@ fn execute_select_with_ctes(
         .map(|f| !f.joins.is_empty())
         .unwrap_or(false);
 
+    // For multi-table joins, push WHERE conditions down to be applied during each join step.
+    // This prevents the cartesian product from blowing up memory.
+    let pushdown_where = if has_joins {
+        stmt.where_clause.clone()
+    } else {
+        None
+    };
+
     let (column_names_owned, raw_rows, table_name) = if has_joins {
         let from = stmt.from.as_ref().unwrap();
         let left_schema = table_schema.unwrap();
@@ -457,6 +465,30 @@ fn execute_select_with_ctes(
             .map(|c| format!("{}.{}", left_alias, c))
             .collect();
         let mut combined_rows: Vec<(i64, Vec<Value>)> = left_rows;
+
+        // Split WHERE into AND-connected terms for predicate pushdown.
+        let where_terms: Vec<Expr> = if let Some(ref w) = pushdown_where {
+            split_and_terms(w)
+        } else {
+            vec![]
+        };
+        let mut used_terms: Vec<bool> = vec![false; where_terms.len()];
+
+        // Apply any WHERE terms that only reference the left table.
+        if !where_terms.is_empty() {
+            let col_refs: Vec<&str> = combined_columns.iter().map(|c| c.as_str()).collect();
+            for (i, term) in where_terms.iter().enumerate() {
+                if expr_columns_available(term, &col_refs) {
+                    combined_rows.retain(|(rowid, values)| {
+                        match eval_expr(term, &col_refs, values, *rowid, None) {
+                            Ok(v) => v.is_truthy(),
+                            Err(_) => true, // keep row if expression can't be evaluated yet
+                        }
+                    });
+                    used_terms[i] = true;
+                }
+            }
+        }
 
         for join in &from.joins {
             let (right_name, right_alias) = match &join.table {
@@ -522,6 +554,15 @@ fn execute_select_with_ctes(
             // Build the all_columns list for expression evaluation during ON.
             let all_columns: Vec<&str> = combined_columns.iter().map(|c| c.as_str()).collect();
 
+            // Collect applicable WHERE terms for this join step (predicate pushdown).
+            let mut pushdown_exprs: Vec<&Expr> = Vec::new();
+            for (i, term) in where_terms.iter().enumerate() {
+                if !used_terms[i] && expr_columns_available(term, &all_columns) {
+                    pushdown_exprs.push(term);
+                    used_terms[i] = true;
+                }
+            }
+
             // Nested loop join.
             let mut new_rows: Vec<(i64, Vec<Value>)> = Vec::new();
 
@@ -554,7 +595,19 @@ fn execute_select_with_ctes(
                         None => true, // CROSS JOIN
                     };
 
-                    if passes {
+                    if !passes {
+                        continue;
+                    }
+
+                    // Apply pushed-down WHERE conditions.
+                    let where_passes = pushdown_exprs.iter().all(|expr| {
+                        match eval_expr(expr, &all_columns, &combined_values, *left_rowid, None) {
+                            Ok(v) => v.is_truthy(),
+                            Err(_) => true,
+                        }
+                    });
+
+                    if where_passes {
                         matched = true;
                         new_rows.push((*left_rowid, combined_values));
                     }
@@ -739,12 +792,63 @@ fn execute_select_with_ctes(
             (cols, rows, filtered_rows)
         };
 
-    // Apply ORDER BY.
+    // Handle compound operations (UNION, UNION ALL, INTERSECT, EXCEPT) before ORDER BY/LIMIT.
     let mut result_rows = result_rows;
+    let has_compound = !stmt.compound.is_empty();
+    if has_compound {
+        for compound in &stmt.compound {
+            let rhs_result = execute_select(pager, &compound.select, tables)?;
+            match compound.op {
+                crate::ast::CompoundOp::UnionAll => {
+                    result_rows.extend(rhs_result.rows);
+                }
+                crate::ast::CompoundOp::Union => {
+                    for row in rhs_result.rows {
+                        if !result_rows
+                            .iter()
+                            .any(|r| rows_equal(&r.values, &row.values))
+                        {
+                            result_rows.push(row);
+                        }
+                    }
+                }
+                crate::ast::CompoundOp::Intersect => {
+                    result_rows.retain(|row| {
+                        rhs_result
+                            .rows
+                            .iter()
+                            .any(|r| rows_equal(&r.values, &row.values))
+                    });
+                }
+                crate::ast::CompoundOp::Except => {
+                    result_rows.retain(|row| {
+                        !rhs_result
+                            .rows
+                            .iter()
+                            .any(|r| rows_equal(&r.values, &row.values))
+                    });
+                }
+            }
+        }
+    }
+
+    // After compound ops, rebuild filtered_rows for ORDER BY key evaluation.
+    let filtered_rows: Vec<(i64, Vec<Value>)> = if has_compound {
+        result_rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (i as i64, r.values.clone()))
+            .collect()
+    } else {
+        filtered_rows
+    };
+
+    // Apply ORDER BY.
     if let Some(ref order_by) = resolved_order_by {
-        // For ORDER BY after GROUP BY, evaluate expressions against result columns.
+        // For ORDER BY after GROUP BY or compound, evaluate against result columns.
         // For regular queries, evaluate against source columns.
-        let is_aggregate = stmt.group_by.is_some() || has_aggregate(&resolved_columns);
+        let is_aggregate =
+            stmt.group_by.is_some() || has_aggregate(&resolved_columns) || has_compound;
         let order_col_names: Vec<&str> = if is_aggregate {
             result_columns.iter().map(|c| c.name.as_str()).collect()
         } else {
@@ -872,45 +976,6 @@ fn execute_select_with_ctes(
         result_rows = result_rows[start..end].to_vec();
     }
 
-    // Handle compound operations (UNION, UNION ALL, INTERSECT, EXCEPT).
-    if !stmt.compound.is_empty() {
-        for compound in &stmt.compound {
-            let rhs_result = execute_select(pager, &compound.select, tables)?;
-            match compound.op {
-                crate::ast::CompoundOp::UnionAll => {
-                    result_rows.extend(rhs_result.rows);
-                }
-                crate::ast::CompoundOp::Union => {
-                    // UNION = UNION ALL + dedup.
-                    for row in rhs_result.rows {
-                        if !result_rows
-                            .iter()
-                            .any(|r| rows_equal(&r.values, &row.values))
-                        {
-                            result_rows.push(row);
-                        }
-                    }
-                }
-                crate::ast::CompoundOp::Intersect => {
-                    result_rows.retain(|row| {
-                        rhs_result
-                            .rows
-                            .iter()
-                            .any(|r| rows_equal(&r.values, &row.values))
-                    });
-                }
-                crate::ast::CompoundOp::Except => {
-                    result_rows.retain(|row| {
-                        !rhs_result
-                            .rows
-                            .iter()
-                            .any(|r| rows_equal(&r.values, &row.values))
-                    });
-                }
-            }
-        }
-    }
-
     Ok(QueryResult {
         columns: result_columns,
         rows: result_rows,
@@ -922,14 +987,100 @@ fn rows_equal(a: &[Value], b: &[Value]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.iter().zip(b.iter()).all(|(va, vb)| match (va, vb) {
-        (Value::Null, Value::Null) => true,
-        (Value::Integer(a), Value::Integer(b)) => a == b,
-        (Value::Real(a), Value::Real(b)) => a == b,
-        (Value::Text(a), Value::Text(b)) => a == b,
-        (Value::Blob(a), Value::Blob(b)) => a == b,
-        _ => false,
-    })
+    a.iter()
+        .zip(b.iter())
+        .all(|(va, vb)| crate::types::sqlite_cmp(va, vb) == std::cmp::Ordering::Equal)
+}
+
+/// Split a WHERE expression into AND-connected terms for predicate pushdown.
+fn split_and_terms(expr: &Expr) -> Vec<Expr> {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOp::And,
+            right,
+        } => {
+            let mut terms = split_and_terms(left);
+            terms.extend(split_and_terms(right));
+            terms
+        }
+        Expr::Parenthesized(inner) => split_and_terms(inner),
+        _ => vec![expr.clone()],
+    }
+}
+
+/// Check if all column references in an expression are available in the given column set.
+fn expr_columns_available(expr: &Expr, available: &[&str]) -> bool {
+    match expr {
+        Expr::ColumnRef { table, column } => {
+            if let Some(t) = table {
+                let qualified = format!("{t}.{column}");
+                available.iter().any(|c| c.eq_ignore_ascii_case(&qualified))
+            } else {
+                // Unqualified: match by bare name.
+                available.iter().any(|c| {
+                    let bare = c.rfind('.').map(|p| &c[p + 1..]).unwrap_or(c);
+                    bare.eq_ignore_ascii_case(column)
+                })
+            }
+        }
+        Expr::Literal(_) => true,
+        Expr::BinaryOp { left, right, .. } => {
+            expr_columns_available(left, available) && expr_columns_available(right, available)
+        }
+        Expr::UnaryOp { operand, .. } => expr_columns_available(operand, available),
+        Expr::Parenthesized(inner) => expr_columns_available(inner, available),
+        Expr::IsNull { operand, .. } => expr_columns_available(operand, available),
+        Expr::Between {
+            operand, low, high, ..
+        } => {
+            expr_columns_available(operand, available)
+                && expr_columns_available(low, available)
+                && expr_columns_available(high, available)
+        }
+        Expr::In { operand, list, .. } => {
+            if !expr_columns_available(operand, available) {
+                return false;
+            }
+            match list {
+                crate::ast::InList::Values(vals) => {
+                    vals.iter().all(|v| expr_columns_available(v, available))
+                }
+                crate::ast::InList::Subquery(_) => true, // subqueries are self-contained
+            }
+        }
+        Expr::Like {
+            operand, pattern, ..
+        } => {
+            expr_columns_available(operand, available) && expr_columns_available(pattern, available)
+        }
+        Expr::FunctionCall { args, .. } => match args {
+            crate::ast::FunctionArgs::Wildcard => true,
+            crate::ast::FunctionArgs::Exprs { args, .. } => {
+                args.iter().all(|a| expr_columns_available(a, available))
+            }
+        },
+        Expr::Cast { expr, .. } => expr_columns_available(expr, available),
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            if let Some(op) = operand {
+                if !expr_columns_available(op, available) {
+                    return false;
+                }
+            }
+            when_clauses.iter().all(|(w, t)| {
+                expr_columns_available(w, available) && expr_columns_available(t, available)
+            }) && else_clause
+                .as_ref()
+                .map(|e| expr_columns_available(e, available))
+                .unwrap_or(true)
+        }
+        Expr::Collate { expr, .. } => expr_columns_available(expr, available),
+        Expr::Subquery(_) | Expr::Exists { .. } | Expr::BindParameter(_) => true,
+    }
 }
 
 /// Check if any result column contains an aggregate function.

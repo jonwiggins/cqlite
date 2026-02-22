@@ -2128,8 +2128,7 @@ mod tests {
         // Allocate overflow pages and fill them.
         let overflow_content = &payload_data[local_size..];
         let content_per_overflow = usable_size - 4;
-        let num_overflow_pages =
-            (overflow_content.len() + content_per_overflow - 1) / content_per_overflow;
+        let num_overflow_pages = overflow_content.len().div_ceil(content_per_overflow);
 
         let mut overflow_page_nums = Vec::new();
         for _ in 0..num_overflow_pages {

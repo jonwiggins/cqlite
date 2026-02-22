@@ -2,6 +2,11 @@
 name = "rsqlite"
 version = "0.1.0"
 edition = "2021"
+description = "A SQLite-compatible database engine built from scratch in Rust"
+repository = "https://github.com/jonwiggins/cqlite"
+license = "MIT"
+keywords = ["sqlite", "database", "sql", "btree", "storage-engine"]
+categories = ["database-implementations", "command-line-utilities"]
 
 [dependencies]
 thiserror = "2"

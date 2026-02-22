@@ -449,7 +449,10 @@ fn test_sqllogictest_basic() {
 
 /// Run all .test files in the sqllogictest directory and print a summary.
 /// Individual file failures don't fail the overall test — this is a progress tracker.
+/// Ignored by default because it takes too long for CI/pre-commit.
+/// Run with: cargo test --test sqllogictest_runner -- --ignored
 #[test]
+#[ignore]
 fn test_sqllogictest_suite_summary() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/sqllogictest");
     let mut entries: Vec<_> = std::fs::read_dir(&dir)
